@@ -4,6 +4,11 @@ PHOENIX — Congo (Katanga) Wildfire Early Warning & Shelter Matching Dashboard
 Same structure as the Algeria streamlit_app.py, pointed at the Congo model
 and shelters database.
 
+PERFORMANCE UPDATE: live PM2.5 is now fetched in one batched request instead
+of one request per grid cell, prediction+AQ results are cached per date so
+sidebar interactions don't redo the work, and the risk-zone layer uses a
+vectorized GeoJson + GeoJsonTooltip instead of per-row Popup HTML building.
+
 Run locally:
     pip install streamlit folium streamlit-folium xgboost pandas requests
     streamlit run congo_streamlit_app.py
@@ -17,13 +22,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
-from folium.plugins import MarkerCluster
+import requests
+from folium.plugins import MarkerCluster, HeatMap
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
 
 from congo_predict import predict_fire_risk
 from risk_engine import get_alert
-from air_quality import fetch_live_pm25
 
 # ---------------------------------------------------------------
 # Page setup
@@ -112,6 +117,70 @@ st.sidebar.markdown(
 )
 
 # ---------------------------------------------------------------
+# PERFORMANCE FIX: batched air-quality fetch (one/few requests instead of
+# one HTTP call per grid cell)
+# ---------------------------------------------------------------
+def fetch_pm25_batch(lat_lon_pairs, chunk_size=30):
+    """Fetch PM2.5 + US AQI for many points in a handful of requests."""
+    AQ_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+    results = {}
+    for i in range(0, len(lat_lon_pairs), chunk_size):
+        chunk = lat_lon_pairs[i:i + chunk_size]
+        lats = ",".join(str(round(p[0], 4)) for p in chunk)
+        lons = ",".join(str(round(p[1], 4)) for p in chunk)
+        try:
+            resp = requests.get(
+                AQ_URL,
+                params={"latitude": lats, "longitude": lons,
+                        "current": "pm2_5,us_aqi", "timezone": "auto"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+        data_list = data if isinstance(data, list) else [data]
+        for point, res in zip(chunk, data_list):
+            current = res.get("current", {})
+            if current.get("pm2_5") is not None:
+                results[point] = {
+                    "pm2_5": current.get("pm2_5"),
+                    "us_aqi": current.get("us_aqi"),
+                }
+    return results
+
+# ---------------------------------------------------------------
+# PERFORMANCE FIX: cache the whole prediction+AQ merge per date so a sidebar
+# click (which reruns the whole script) doesn't redo model inference + API
+# calls every time. TTL of 15 min keeps "live" AQ reasonably fresh.
+# ---------------------------------------------------------------
+@st.cache_data(ttl=900)
+def compute_results_for_date(day_data_records, doy, is_latest):
+    pm25_lookup = {}
+    if is_latest:
+        pairs = [(r["LAT"], r["LON"]) for r in day_data_records]
+        pm25_lookup = fetch_pm25_batch(pairs)
+
+    results = []
+    success_count = 0
+    for row in day_data_records:
+        r = predict_fire_risk(
+            lat=row["LAT"], lon=row["LON"], doy=doy,
+            t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
+            rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+        )
+        entry = {**row, **r, "pm2_5": None, "health_level": None, "health_advice": None}
+        aq = pm25_lookup.get((row["LAT"], row["LON"]))
+        if aq:
+            success_count += 1
+            alert = get_alert(r["fire_probability"], aq["pm2_5"])
+            entry.update({"pm2_5": aq["pm2_5"], "health_level": alert.health_level,
+                           "health_advice": alert.health_advice})
+        results.append(entry)
+
+    return pd.DataFrame(results), success_count
+
+# ---------------------------------------------------------------
 # Run model on all grid cells for the selected date
 # ---------------------------------------------------------------
 day_data = climate[climate["date"] == selected_date].copy()
@@ -119,24 +188,9 @@ doy = pd.Timestamp(selected_date).dayofyear
 is_latest_available = pd.Timestamp(selected_date).normalize() == pd.Timestamp(available_dates[-1]).normalize()
 latest_date_str = pd.Timestamp(available_dates[-1]).strftime("%Y-%m-%d")
 
-results = []
-aqi_fetch_success_count = 0
-for _, row in day_data.iterrows():
-    r = predict_fire_risk(
-        lat=row["LAT"], lon=row["LON"], doy=doy,
-        t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
-        rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
-    )
-    entry = {**row.to_dict(), **r, "pm2_5": None, "health_level": None, "health_advice": None}
-    if is_latest_available:
-        pm25 = fetch_live_pm25(row["LAT"], row["LON"])
-        if pm25 is not None:
-            aqi_fetch_success_count += 1
-            alert = get_alert(r["fire_probability"], pm25)
-            entry.update({"pm2_5": pm25, "health_level": alert.health_level,
-                           "health_advice": alert.health_advice})
-    results.append(entry)
-res_df = pd.DataFrame(results)
+res_df, aqi_fetch_success_count = compute_results_for_date(
+    day_data.to_dict("records"), doy, is_latest_available
+)
 
 if is_latest_available:
     if aqi_fetch_success_count == 0:
@@ -148,8 +202,8 @@ if is_latest_available:
         st.info(f"🫁 Live air-quality retrieved for {aqi_fetch_success_count}/{len(day_data)} zones "
                 f"(a few requests timed out — this is normal and will vary run to run).")
     else:
-        st.caption(f"🫁 Air-quality readings below are live (fetched just now). Fire-risk inputs are from "
-                   f"**{latest_date_str}** — the most recent weather data available.")
+        st.caption(f"🫁 Air-quality readings below are live (fetched just now, cached for 15 min). "
+                   f"Fire-risk inputs are from **{latest_date_str}** — the most recent weather data available.")
 else:
     st.caption(f"ℹ️ Air-quality/health warnings are only shown for the most recent available date "
                f"(**{latest_date_str}**) — move the slider to the far right to see them.")
@@ -179,68 +233,59 @@ m = folium.Map(
 )
 
 # ---------------------------------------------------------------
-# Add wildfire risk zones
+# PERFORMANCE FIX: risk zones as a single vectorized GeoJson layer with
+# GeoJsonTooltip/Popup, instead of one folium.CircleMarker + manually-built
+# Popup HTML per row.
 # ---------------------------------------------------------------
+risk_features = []
 for _, row in res_df.iterrows():
+    pm25_val = row.get("pm2_5")
+    health_level_val = row.get("health_level")
+    health_advice_val = row.get("health_advice")
+    risk_features.append({
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [row["LON"], row["LAT"]]},
+        "properties": {
+            "risk_level": row["risk_level"],
+            "fire_probability_pct": round(row["fire_probability"] * 100, 1),
+            "t2m_max": round(row["T2M_MAX"], 1),
+            "rh2m": round(row["RH2M"], 1),
+            "health_level": health_level_val if pd.notna(health_level_val) else "N/A",
+            "pm2_5": round(float(pm25_val), 0) if pd.notna(pm25_val) else None,
+            "health_advice": health_advice_val if pd.notna(health_advice_val) else "",
+        },
+    })
 
-    health_html = ""
+def risk_style_function(feature):
+    color = COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
+    return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
 
-    # Safely handle health level / PM2.5 values
-    health_level_raw = row.get("health_level")
+folium.GeoJson(
+    {"type": "FeatureCollection", "features": risk_features},
+    name="Fire risk zones",
+    marker=folium.CircleMarker(radius=14, fill=True),
+    style_function=risk_style_function,
+    tooltip=folium.GeoJsonTooltip(
+        fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5"],
+        aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
+                 "Air quality:", "PM2.5 (µg/m³):"],
+        sticky=True,
+    ),
+    popup=folium.GeoJsonPopup(
+        fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5", "health_advice"],
+        aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
+                 "Air quality:", "PM2.5 (µg/m³):", "Advice:"],
+        max_width=260,
+    ),
+).add_to(m)
 
-    if pd.notna(health_level_raw):
-        health_level = str(health_level_raw).strip().title()
-
-        pm25_raw = row.get("pm2_5")
-
-        if pd.notna(pm25_raw):
-            try:
-                pm25 = float(pm25_raw)
-                health_advice = row.get("health_advice", "")
-
-                if pd.isna(health_advice):
-                    health_advice = ""
-
-                health_advice = str(health_advice)
-
-                health_html = (
-                    f"<br><b>🫁 Air quality:</b> {health_level} "
-                    f"(PM2.5: {pm25:.0f} µg/m³)<br>"
-                    f"{health_advice}"
-                )
-            except (ValueError, TypeError):
-                health_html = (
-                    f"<br><b>🫁 Air quality:</b> {health_level}"
-                )
-        else:
-            health_html = (
-                f"<br><b>🫁 Air quality:</b> {health_level}"
-            )
-
-    risk_color = COLOR_MAP.get(
-        row["risk_level"],
-        "gray"
-    )
-
-    folium.CircleMarker(
-        location=[row["LAT"], row["LON"]],
-        radius=14,
-        color=risk_color,
-        fill=True,
-        fill_color=risk_color,
-        fill_opacity=0.7,
-        weight=2,
-        popup=folium.Popup(
-            f"<b>{row['risk_level']} risk</b><br>"
-            f"Fire probability: {row['fire_probability'] * 100:.1f}%<br>"
-            f"Max Temp: {row['T2M_MAX']:.1f}°C | "
-            f"Humidity: {row['RH2M']:.1f}%"
-            f"{health_html}",
-            max_width=260,
-        ),
-        tooltip=f"{row['risk_level']} risk",
-    ).add_to(m)
-
+# ---------------------------------------------------------------
+# Optional heatmap overview (off by default — toggle via layer control)
+# ---------------------------------------------------------------
+heat_data = [[row["LAT"], row["LON"], row["fire_probability"]] for _, row in res_df.iterrows()]
+heat_fg = folium.FeatureGroup(name="Risk density (heatmap)", show=False)
+HeatMap(heat_data, radius=18, blur=22, max_zoom=8).add_to(heat_fg)
+heat_fg.add_to(m)
 
 # ---------------------------------------------------------------
 # Add shelters and support resources
@@ -265,12 +310,10 @@ for _, s in shelters_to_draw.iterrows():
         kind = "Support resource (not for housing evacuees)"
 
     aqi_html = ""
-
     pm25_shelter = s.get("pm2_5")
     us_aqi_shelter = s.get("us_aqi")
 
     if pd.notna(pm25_shelter):
-
         if pd.notna(us_aqi_shelter):
             aqi_html = (
                 f"<br><b>🫁 Current AQI:</b> "
@@ -278,17 +321,11 @@ for _, s in shelters_to_draw.iterrows():
                 f"(PM2.5: {float(pm25_shelter):.1f} µg/m³)"
             )
         else:
-            aqi_html = (
-                f"<br><b>🫁 PM2.5:</b> "
-                f"{float(pm25_shelter):.1f} µg/m³"
-            )
+            aqi_html = f"<br><b>🫁 PM2.5:</b> {float(pm25_shelter):.1f} µg/m³"
 
         observation_time = s.get("observation_time")
-
         if pd.notna(observation_time):
-            aqi_html += (
-                f"<br><small>as of {observation_time}</small>"
-            )
+            aqi_html += f"<br><small>as of {observation_time}</small>"
 
     folium.CircleMarker(
         location=[s["lat"], s["lon"]],
@@ -302,14 +339,14 @@ for _, s in shelters_to_draw.iterrows():
             f"<b>{s['name']}</b><br>"
             f"{kind}<br>"
             f"{s['province']}<br>"
-            f"Est. capacity: "
-            f"{s['available']}/{s['capacity']}"
+            f"Est. capacity: {s['available']}/{s['capacity']}"
             f"{aqi_html}",
             max_width=260,
         ),
         tooltip=s["name"],
     ).add_to(shelter_cluster)
 
+folium.LayerControl(collapsed=False).add_to(m)
 
 # ---------------------------------------------------------------
 # Map marker information
