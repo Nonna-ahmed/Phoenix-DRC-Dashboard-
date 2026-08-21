@@ -25,10 +25,7 @@ import os
 try:
     MODEL_PATH = os.path.join(BASE, "congo_fire_risk_model.json")
 except NameError:
-    MODEL_PATH = ("/content/drive/MyDrive/AI Hackthon Team3/"
-                  "Democratic Republic of the Congo Southern DRC – Former Katanga "
-                  "(Haut-Katanga, Lualaba & Tanganyika) 23.0, -13.5, 30.0, -7.0/"
-                  "Phase 1 Data Collection/congo_fire_risk_model.json")
+    MODEL_PATH = os.path.join(os.path.dirname(__file__), "congo_fire_risk_model.json")
 
 THRESHOLD_LOW = 0.35
 THRESHOLD_HIGH = 0.65
