@@ -346,7 +346,7 @@ for _, s in shelters_to_draw.iterrows():
         tooltip=s["name"],
     ).add_to(shelter_cluster)
 
-folium.LayerControl(collapsed=False).add_to(m)
+folium.LayerControl(position="topleft", collapsed=False).add_to(m)
 
 # ---------------------------------------------------------------
 # Map marker information
@@ -365,7 +365,7 @@ if len(shelters) > max_markers:
 # ---------------------------------------------------------------
 st_folium(
     m,
-    width=1100,
+    use_container_width=True,
     height=550,
     returned_objects=[]
 )
