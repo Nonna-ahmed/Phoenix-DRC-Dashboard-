@@ -51,6 +51,27 @@ SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
 if "available" not in SHELTERS_DF.columns:
     SHELTERS_DF["available"] = SHELTERS_DF["capacity"]
 
+# ── FIX #1: is_shelter column ───────────────────────────────────
+if "is_shelter" not in SHELTERS_DF.columns:
+    if "capacity_source" in SHELTERS_DF.columns:
+        SHELTERS_DF["is_shelter"] = SHELTERS_DF["capacity_source"] != "default_estimate_non_shelter"
+    else:
+        SHELTERS_DF["is_shelter"] = True
+
+# ── FIX #2: name column (no nulls) ──────────────────────────────
+if "name" not in SHELTERS_DF.columns:
+    SHELTERS_DF["name"] = None
+SHELTERS_DF["name"] = SHELTERS_DF["name"].fillna(SHELTERS_DF["category"].astype(str) + " (unnamed)")
+
+# ── FIX #3: province column ─────────────────────────────────────
+if "province" not in SHELTERS_DF.columns:
+    SHELTERS_DF["province"] = None
+
+# ── FIX #4: AQI columns (no live feed yet) ──────────────────────
+for col in ["pm2_5", "us_aqi", "observation_time"]:
+    if col not in SHELTERS_DF.columns:
+        SHELTERS_DF[col] = None
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371
@@ -164,7 +185,7 @@ def list_shelters(
     province: Optional[str] = Query(None, description="Haut-Katanga, Lualaba, or Tanganyika"),
     only_shelters: bool = Query(False, description="If true, exclude health facilities (support-only)"),
 ):
-    df = SHELTERS_DF
+    df = SHELTERS_DF.copy()
     if category:
         df = df[df["category"] == category]
     if province:
