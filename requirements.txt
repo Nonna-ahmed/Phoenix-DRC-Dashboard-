@@ -1,0 +1,11 @@
+streamlit
+folium
+streamlit-folium
+xgboost
+pandas
+scikit-learn
+fastapi
+uvicorn[standard]
+pydantic
+africastalking
+requests
