@@ -168,48 +168,128 @@ col4.metric("Shelters with capacity", int((shelter_only["available"] > 0).sum())
 # Map
 # ---------------------------------------------------------------
 st.subheader("Live Risk Map")
-center_lat, center_lon = res_df["LAT"].mean(), res_df["LON"].mean()
-m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="CartoDB positron")
 
-for _, row in res_df.iterrows():
-    health_html = ""
-    if row["health_level"]:
-        health_level = str(row.get('health_level', 'Unknown')).strip().title()
-pm25 = row.get('pm2_5', 0)
-health_advice = str(row.get('health_advice', '') or '')
+center_lat = res_df["LAT"].mean()
+center_lon = res_df["LON"].mean()
 
-health_html = (
-    f"<br><b>🫁 Air quality:</b> {health_level} "
-    f"(PM2.5: {pm25:.0f} µg/m³)<br>{health_advice}"
+m = folium.Map(
+    location=[center_lat, center_lon],
+    zoom_start=6,
+    tiles="CartoDB positron"
 )
+
+# ---------------------------------------------------------------
+# Add wildfire risk zones
+# ---------------------------------------------------------------
+for _, row in res_df.iterrows():
+
+    health_html = ""
+
+    # Safely handle health level / PM2.5 values
+    health_level_raw = row.get("health_level")
+
+    if pd.notna(health_level_raw):
+        health_level = str(health_level_raw).strip().title()
+
+        pm25_raw = row.get("pm2_5")
+
+        if pd.notna(pm25_raw):
+            try:
+                pm25 = float(pm25_raw)
+                health_advice = row.get("health_advice", "")
+
+                if pd.isna(health_advice):
+                    health_advice = ""
+
+                health_advice = str(health_advice)
+
+                health_html = (
+                    f"<br><b>🫁 Air quality:</b> {health_level} "
+                    f"(PM2.5: {pm25:.0f} µg/m³)<br>"
+                    f"{health_advice}"
+                )
+            except (ValueError, TypeError):
+                health_html = (
+                    f"<br><b>🫁 Air quality:</b> {health_level}"
+                )
+        else:
+            health_html = (
+                f"<br><b>🫁 Air quality:</b> {health_level}"
+            )
+
+    risk_color = COLOR_MAP.get(
+        row["risk_level"],
+        "gray"
+    )
+
     folium.CircleMarker(
         location=[row["LAT"], row["LON"]],
         radius=14,
-        color=COLOR_MAP[row["risk_level"]],
+        color=risk_color,
         fill=True,
-        fill_color=COLOR_MAP[row["risk_level"]],
+        fill_color=risk_color,
         fill_opacity=0.7,
         weight=2,
         popup=folium.Popup(
             f"<b>{row['risk_level']} risk</b><br>"
-            f"Fire probability: {row['fire_probability']*100:.1f}%<br>"
-            f"Max Temp: {row['T2M_MAX']:.1f}°C | Humidity: {row['RH2M']:.1f}%"
+            f"Fire probability: {row['fire_probability'] * 100:.1f}%<br>"
+            f"Max Temp: {row['T2M_MAX']:.1f}°C | "
+            f"Humidity: {row['RH2M']:.1f}%"
             f"{health_html}",
             max_width=260,
         ),
         tooltip=f"{row['risk_level']} risk",
     ).add_to(m)
 
-shelter_cluster = MarkerCluster(name="Shelters & Resources").add_to(m)
-shelters_to_draw = shelters.sort_values("capacity", ascending=False).head(max_markers)
+
+# ---------------------------------------------------------------
+# Add shelters and support resources
+# ---------------------------------------------------------------
+shelter_cluster = MarkerCluster(
+    name="Shelters & Resources"
+).add_to(m)
+
+shelters_to_draw = (
+    shelters
+    .sort_values("capacity", ascending=False)
+    .head(max_markers)
+)
+
 for _, s in shelters_to_draw.iterrows():
+
     if s["is_shelter"]:
-        color, kind = "blue", "Shelter"
+        color = "blue"
+        kind = "Shelter"
     else:
-        color, kind = "darkcyan", "Support resource (not for housing evacuees)"
+        color = "darkcyan"
+        kind = "Support resource (not for housing evacuees)"
+
     aqi_html = ""
-    if pd.notna(s.get("pm2_5")):
-        aqi_html = f"<br><b>🫁 Current AQI:</b> {s['us_aqi']:.0f} (PM2.5: {s['pm2_5']:.1f} µg/m³)<br><small>as of {s['observation_time']}</small>"
+
+    pm25_shelter = s.get("pm2_5")
+    us_aqi_shelter = s.get("us_aqi")
+
+    if pd.notna(pm25_shelter):
+
+        if pd.notna(us_aqi_shelter):
+            aqi_html = (
+                f"<br><b>🫁 Current AQI:</b> "
+                f"{float(us_aqi_shelter):.0f} "
+                f"(PM2.5: {float(pm25_shelter):.1f} µg/m³)"
+            )
+        else:
+            aqi_html = (
+                f"<br><b>🫁 PM2.5:</b> "
+                f"{float(pm25_shelter):.1f} µg/m³"
+            )
+
+        observation_time = s.get("observation_time")
+
+        if pd.notna(observation_time):
+            aqi_html += (
+                f"<br><small>as of {observation_time}</small>"
+            )
+
     folium.CircleMarker(
         location=[s["lat"], s["lon"]],
         radius=6,
@@ -219,82 +299,36 @@ for _, s in shelters_to_draw.iterrows():
         fill_opacity=0.8,
         weight=1,
         popup=folium.Popup(
-            f"<b>{s['name']}</b><br>{kind}<br>{s['province']}<br>"
-            f"Est. capacity: {s['available']}/{s['capacity']}{aqi_html}",
+            f"<b>{s['name']}</b><br>"
+            f"{kind}<br>"
+            f"{s['province']}<br>"
+            f"Est. capacity: "
+            f"{s['available']}/{s['capacity']}"
+            f"{aqi_html}",
             max_width=260,
         ),
         tooltip=s["name"],
     ).add_to(shelter_cluster)
 
+
+# ---------------------------------------------------------------
+# Map marker information
+# ---------------------------------------------------------------
 if len(shelters) > max_markers:
-    st.caption(f"Showing the {max_markers} largest-capacity locations out of {len(shelters)} matching your filters "
-               f"(adjust the slider in the sidebar to show more). All {len(shelters)} are still used in the "
-               f"shelter-matching table below.")
-
-st_folium(m, width=1100, height=550, returned_objects=[])
-
-# ---------------------------------------------------------------
-# High-risk zones -> nearest shelter matching
-# ---------------------------------------------------------------
-def haversine_km_vec(lat1, lon1, lat_arr, lon_arr):
-    """Vectorized haversine distance (km) from one point to an array of points."""
-    R = 6371
-    lat1r, lon1r = radians(lat1), radians(lon1)
-    lat2r, lon2r = np.radians(lat_arr), np.radians(lon_arr)
-    dlat = lat2r - lat1r
-    dlon = lon2r - lon1r
-    a = np.sin(dlat / 2) ** 2 + cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
-    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-
-st.subheader("⚠️ High-Risk Zones → Nearest Available Shelter")
-high_risk = res_df[res_df["risk_level"] == "High"].copy()
-
-if high_risk.empty:
-    st.success("No high-risk zones detected for this date.")
-else:
-    matches = []
-    avail = shelters[(shelters["is_shelter"]) & (shelters["available"] > 0)].copy()
-    for _, zone in high_risk.iterrows():
-        if avail.empty:
-            matches.append({"Zone (lat,lon)": f"{zone['LAT']}, {zone['LON']}",
-                             "Fire probability": f"{zone['fire_probability']*100:.1f}%",
-                             "Nearest shelter": "⚠️ No capacity available nearby"})
-            continue
-        dists = haversine_km_vec(zone["LAT"], zone["LON"], avail["lat"].values, avail["lon"].values)
-        nearest_idx = dists.argmin()
-        nearest = avail.iloc[nearest_idx]
-        matches.append({
-            "Zone (lat,lon)": f"{zone['LAT']}, {zone['LON']}",
-            "Fire probability": f"{zone['fire_probability']*100:.1f}%",
-            "Nearest shelter": nearest["name"],
-            "Province": nearest["province"],
-            "Distance (km)": f"{dists[nearest_idx]:.1f}",
-            "Shelter capacity": f"{nearest['available']}/{nearest['capacity']}",
-        })
-    st.dataframe(pd.DataFrame(matches), use_container_width=True)
-    if (pd.DataFrame(matches).get("Distance (km)", pd.Series(dtype=float)).astype(str).str.replace(".","",1).str.isdigit()).any():
-        long_dist = pd.DataFrame(matches)
-        if "Distance (km)" in long_dist.columns:
-            long_dist["_d"] = pd.to_numeric(long_dist["Distance (km)"], errors="coerce")
-            if (long_dist["_d"] > 30).any():
-                st.caption("⚠️ Some matched shelters are 30+ km away — shelter coverage in Lualaba/Tanganyika "
-                           "is sparser than Haut-Katanga; this is a genuine data-coverage gap, not a bug.")
+    st.caption(
+        f"Showing the {max_markers} largest-capacity locations "
+        f"out of {len(shelters)} matching your filters "
+        f"(adjust the slider in the sidebar to show more). "
+        f"All {len(shelters)} are still used in the "
+        f"shelter-matching table below."
+    )
 
 # ---------------------------------------------------------------
-# Simulated SMS alert log
+# Display map
 # ---------------------------------------------------------------
-st.subheader("📱 Simulated SMS/USSD Alerts")
-if not high_risk.empty:
-    for _, zone in high_risk.iterrows():
-        health_line = f" {zone['health_advice']}" if zone.get("health_advice") else ""
-        st.code(
-            f"[ALERT] High wildfire risk near ({zone['LAT']}, {zone['LON']}). "
-            f"Probability: {zone['fire_probability']*100:.0f}%. "
-            f"Move livestock/valuables and check nearest shelter now.{health_line}",
-            language=None,
-        )
-else:
-    st.info("No alerts to send for this date.")
-
-st.caption("Data sources: NASA FIRMS (fire history) · NASA POWER (climate) · GRID3/OSM (facilities) · "
-           "Model: XGBoost, threshold-tuned")
+st_folium(
+    m,
+    width=1100,
+    height=550,
+    returned_objects=[]
+)
