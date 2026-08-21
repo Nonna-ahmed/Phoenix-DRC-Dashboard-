@@ -174,7 +174,14 @@ m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="CartoDB p
 for _, row in res_df.iterrows():
     health_html = ""
     if row["health_level"]:
-        health_html = f"<br><b>🫁 Air quality:</b> {row['health_level'].title()} (PM2.5: {row['pm2_5']:.0f} µg/m³)<br>{row['health_advice']}"
+        health_level = str(row.get('health_level', 'Unknown')).strip().title()
+pm25 = row.get('pm2_5', 0)
+health_advice = str(row.get('health_advice', '') or '')
+
+health_html = (
+    f"<br><b>🫁 Air quality:</b> {health_level} "
+    f"(PM2.5: {pm25:.0f} µg/m³)<br>{health_advice}"
+)
     folium.CircleMarker(
         location=[row["LAT"], row["LON"]],
         radius=14,
