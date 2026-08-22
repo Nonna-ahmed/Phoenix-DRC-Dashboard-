@@ -42,35 +42,31 @@ app = FastAPI(
 )
 
 CLIMATE_DF = pd.read_csv("phoenix_climate_2020_2026.csv")
+# NASA POWER has a ~3-5 day processing lag; unprocessed recent days come
+# back as the fill value -999 instead of real numbers — drop those rows.
+_weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
+_bad = (CLIMATE_DF[_weather_cols] < -900).any(axis=1)
+if _bad.any():
+    CLIMATE_DF = CLIMATE_DF[~_bad].copy()
+CLIMATE_DF = CLIMATE_DF.dropna(subset=["YEAR", "DOY"])  # a few rows have genuinely missing YEAR/DOY
+CLIMATE_DF["YEAR"] = CLIMATE_DF["YEAR"].astype(int)
+CLIMATE_DF["DOY"] = CLIMATE_DF["DOY"].astype(int)
 CLIMATE_DF["date"] = pd.to_datetime(CLIMATE_DF["YEAR"].astype(str), format="%Y") + \
                       pd.to_timedelta(CLIMATE_DF["DOY"] - 1, unit="D")
-LATEST_AVAILABLE_DATE = CLIMATE_DF["date"].max().normalize()
+
+# Use the latest date with FULL grid coverage, not just any row's max date —
+# staggered NASA POWER processing across the region can otherwise leave a
+# "latest date" that only covers part of the area.
+_total_cells = CLIMATE_DF[["LAT", "LON"]].drop_duplicates().shape[0]
+_counts_per_date = CLIMATE_DF.groupby("date").size()
+_full_coverage_dates = _counts_per_date[_counts_per_date == _total_cells]
+LATEST_AVAILABLE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
+                          else CLIMATE_DF["date"].max()).normalize()
 
 SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
 SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
 if "available" not in SHELTERS_DF.columns:
     SHELTERS_DF["available"] = SHELTERS_DF["capacity"]
-
-# ── FIX #1: is_shelter column ───────────────────────────────────
-if "is_shelter" not in SHELTERS_DF.columns:
-    if "capacity_source" in SHELTERS_DF.columns:
-        SHELTERS_DF["is_shelter"] = SHELTERS_DF["capacity_source"] != "default_estimate_non_shelter"
-    else:
-        SHELTERS_DF["is_shelter"] = True
-
-# ── FIX #2: name column (no nulls) ──────────────────────────────
-if "name" not in SHELTERS_DF.columns:
-    SHELTERS_DF["name"] = None
-SHELTERS_DF["name"] = SHELTERS_DF["name"].fillna(SHELTERS_DF["category"].astype(str) + " (unnamed)")
-
-# ── FIX #3: province column ─────────────────────────────────────
-if "province" not in SHELTERS_DF.columns:
-    SHELTERS_DF["province"] = None
-
-# ── FIX #4: AQI columns (no live feed yet) ──────────────────────
-for col in ["pm2_5", "us_aqi", "observation_time"]:
-    if col not in SHELTERS_DF.columns:
-        SHELTERS_DF[col] = None
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -185,7 +181,7 @@ def list_shelters(
     province: Optional[str] = Query(None, description="Haut-Katanga, Lualaba, or Tanganyika"),
     only_shelters: bool = Query(False, description="If true, exclude health facilities (support-only)"),
 ):
-    df = SHELTERS_DF.copy()
+    df = SHELTERS_DF
     if category:
         df = df[df["category"] == category]
     if province:
