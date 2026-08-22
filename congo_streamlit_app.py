@@ -58,8 +58,45 @@ COLOR_MAP = {"Low": "green", "Medium": "orange", "High": "red"}
 FUTURE_COLOR_MAP = {"High": "#e74c3c", "Moderate": "#f39c12", "Low": "#27ae60"}
 
 # -------------------------------------------------------------
-# Load data (cached so it only loads once per session)
+# Nearest-facility helper (vectorized haversine — fast even for
+# many risk zones x many shelters/hospitals)
 # -------------------------------------------------------------
+def nearest_facility(zone_lats, zone_lons, cand_df):
+    """For each (zone_lat, zone_lon), find the nearest row in cand_df
+    (which must have 'lat'/'lon' columns). Returns a DataFrame with the
+    matched candidate's info plus a 'distance_km' column, aligned by
+    position to zone_lats/zone_lons. If cand_df is empty, all fields
+    come back as None/NaN."""
+    if cand_df.empty:
+        return pd.DataFrame({
+            "name": [None] * len(zone_lats),
+            "lat": [None] * len(zone_lats),
+            "lon": [None] * len(zone_lats),
+            "available": [None] * len(zone_lats),
+            "capacity": [None] * len(zone_lats),
+            "province": [None] * len(zone_lats),
+            "distance_km": [np.nan] * len(zone_lats),
+        })
+
+    R = 6371.0  # Earth radius, km
+    zlat = np.radians(np.asarray(zone_lats, dtype=float))[:, None]
+    zlon = np.radians(np.asarray(zone_lons, dtype=float))[:, None]
+    clat = np.radians(cand_df["lat"].to_numpy(dtype=float))[None, :]
+    clon = np.radians(cand_df["lon"].to_numpy(dtype=float))[None, :]
+
+    dlat = clat - zlat
+    dlon = clon - zlon
+    a = np.sin(dlat / 2) ** 2 + np.cos(zlat) * np.cos(clat) * np.sin(dlon / 2) ** 2
+    dist = 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+    nearest_idx = np.argmin(dist, axis=1)
+    nearest_dist = dist[np.arange(len(zone_lats)), nearest_idx]
+
+    matched = cand_df.iloc[nearest_idx].reset_index(drop=True)
+    matched["distance_km"] = nearest_dist
+    return matched
+
+
 @st.cache_data
 def load_climate():
     df = pd.read_csv("phoenix_climate_2020_2026.csv")
@@ -384,6 +421,46 @@ with tab1:
         )
 
     st_folium(m, use_container_width=True, height=550, returned_objects=[])
+
+    # ---------------------------------------------------------------
+    # Nearest shelter & hospital table (for at-risk zones)
+    # ---------------------------------------------------------------
+    st.subheader("🏥 Nearest Shelter & Hospital for At-Risk Zones")
+
+    at_risk = res_df[res_df["risk_level"].isin(["High", "Medium"])].copy()
+
+    if at_risk.empty:
+        st.info("No Medium/High risk zones for the selected date — nothing to match to shelters right now.")
+    else:
+        shelters_pool = shelters_all[shelters_all["is_shelter"]]
+        hospitals_pool = shelters_all[shelters_all["category"] == "health_facility"]
+
+        nearest_shelter = nearest_facility(at_risk["LAT"], at_risk["LON"], shelters_pool)
+        nearest_hospital = nearest_facility(at_risk["LAT"], at_risk["LON"], hospitals_pool)
+
+        table = pd.DataFrame({
+            "Risk": at_risk["risk_level"].values,
+            "Fire Probability": (at_risk["fire_probability"] * 100).round(1).astype(str).values,
+            "Zone Lat": at_risk["LAT"].round(3).values,
+            "Zone Lon": at_risk["LON"].round(3).values,
+            "Nearest Shelter": nearest_shelter["name"].values,
+            "Shelter Dist (km)": nearest_shelter["distance_km"].round(1).values,
+            "Shelter Avail/Cap": [
+                f"{a}/{c}" if pd.notna(a) else "—"
+                for a, c in zip(nearest_shelter["available"], nearest_shelter["capacity"])
+            ],
+            "Nearest Hospital": nearest_hospital["name"].values,
+            "Hospital Dist (km)": nearest_hospital["distance_km"].round(1).values,
+        })
+        table["Fire Probability"] = table["Fire Probability"] + "%"
+        table = table.sort_values(["Risk", "Shelter Dist (km)"], ascending=[True, True])
+
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.caption(
+            "Shows Medium/High risk zones only, matched to the closest evacuee shelter "
+            "(school or place of worship) and closest health facility by straight-line distance. "
+            "Distances are approximate (haversine), not driving distance."
+        )
 
 # =================================================================
 # TAB 2: Future Prediction (NEW!)
