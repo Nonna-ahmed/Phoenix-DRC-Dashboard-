@@ -63,10 +63,20 @@ FUTURE_COLOR_MAP = {"High": "#e74c3c", "Moderate": "#f39c12", "Low": "#27ae60"}
 @st.cache_data
 def load_climate():
     df = pd.read_csv("phoenix_climate_2020_2026.csv")
+    # NASA POWER has a ~3-5 day processing lag; the most recent unprocessed
+    # days come back as the fill value -999 instead of real numbers. Drop
+    # those rows entirely so broken -999 readings never reach the map/table
+    # (replacing with NaN and keeping the row was letting bad/incomplete
+    # temperature values leak into the "latest date" view).
+    weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
+    bad = (df[weather_cols] < -900).any(axis=1)
+    if bad.any():
+        df = df[~bad].copy()
+    df = df.dropna(subset=["YEAR", "DOY"])  # a few rows have genuinely missing YEAR/DOY
+    df["YEAR"] = df["YEAR"].astype(int)
+    df["DOY"] = df["DOY"].astype(int)
     df["date"] = pd.to_datetime(df["YEAR"].astype(str), format="%Y") + \
                  pd.to_timedelta(df["DOY"] - 1, unit="D")
-    weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
-    df[weather_cols] = df[weather_cols].replace(-999, np.nan)
     return df
 
 @st.cache_data
@@ -81,6 +91,16 @@ def load_shelters():
                "is_shelter", "province", "pm2_5", "us_aqi", "observation_time"]]
 
 climate = load_climate()
+
+# Latest date with FULL grid coverage, not just any row's max date —
+# staggered NASA POWER processing across the region can otherwise leave a
+# "latest date" that only covers part of the area (and shows wrong/partial
+# temperature numbers for the rest).
+_total_cells = climate[["LAT", "LON"]].drop_duplicates().shape[0]
+_counts_per_date = climate.groupby("date").size()
+_full_coverage_dates = _counts_per_date[_counts_per_date == _total_cells]
+LATEST_FULL_COVERAGE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
+                              else climate["date"].max())
 shelters_all = load_shelters()
 
 # -------------------------------------------------------------
@@ -118,20 +138,15 @@ st.sidebar.caption("Lower this if the map feels slow to load. Largest-capacity l
 st.sidebar.header("Controls")
 available_dates = sorted(climate["date"].unique())
 
-weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
-complete_dates = (
-    climate.dropna(subset=weather_cols)
-    .groupby("date").size()
-    .index.tolist()
-)
-default_date = complete_dates[-1] if complete_dates else available_dates[-1]
-
 selected_date = st.sidebar.select_slider(
     "Select date",
     options=available_dates,
-    value=default_date,
+    value=LATEST_FULL_COVERAGE_DATE,
     format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"),
 )
+st.sidebar.caption(f"Defaulting to {pd.Timestamp(LATEST_FULL_COVERAGE_DATE).strftime('%Y-%m-%d')} — "
+                    f"the most recent date with complete data for all grid cells. "
+                    f"Some later dates may only have partial coverage.")
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Risk thresholds**\n\n"
@@ -223,8 +238,8 @@ with tab1:
 
     day_data = climate[climate["date"] == selected_date].copy()
     doy = pd.Timestamp(selected_date).dayofyear
-    is_latest_available = pd.Timestamp(selected_date).normalize() == pd.Timestamp(available_dates[-1]).normalize()
-    latest_date_str = pd.Timestamp(available_dates[-1]).strftime("%Y-%m-%d")
+    is_latest_available = pd.Timestamp(selected_date).normalize() == pd.Timestamp(LATEST_FULL_COVERAGE_DATE).normalize()
+    latest_date_str = pd.Timestamp(LATEST_FULL_COVERAGE_DATE).strftime("%Y-%m-%d")
 
     res_df, aqi_fetch_success_count, _ = compute_results_for_date(
         day_data.to_dict("records"), doy, is_latest_available
