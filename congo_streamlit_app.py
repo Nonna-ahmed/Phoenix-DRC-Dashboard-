@@ -224,7 +224,13 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
     """Places a real outbound voice call via Africa's Talking's Voice REST API.
     Africa's Talking calls back {API_BASE_URL}/voice once the call connects to
     fetch what to actually say — the message + language are passed through as
-    clientState so the backend (congo_api.py) knows what to speak."""
+    clientState so the backend (congo_api.py) knows what to speak.
+
+    NOTE: unlike SMS, Africa's Talking's Voice API has no free sandbox mode —
+    "voice.sandbox.africastalking.com" doesn't exist (it was a docs error /
+    deprecated endpoint, which is why it failed DNS resolution). ALL voice
+    calls go through the live endpoint and are billed for real, even with a
+    sandbox username/app. Test with your own number first."""
     import json
 
     username = st.secrets.get("AT_USERNAME")
@@ -233,8 +239,7 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
     if not username or not api_key or not caller_id:
         return {"error": "AT_USERNAME / AT_API_KEY / AT_VOICE_CALLER_ID not set in Streamlit secrets."}
 
-    is_sandbox = username == "sandbox"
-    url = "https://voice.sandbox.africastalking.com/call" if is_sandbox else "https://voice.africastalking.com/call"
+    url = "https://voice.africastalking.com/call"
     try:
         resp = requests.post(
             url,
@@ -291,7 +296,8 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                     st.success(f"Call placed! Response: {voice_result}")
 
     st.caption(
-        "⚠️ SMS and voice calls are REAL and may incur cost outside the free Sandbox. "
+        "⚠️ SMS sends for free in the Sandbox, but **voice calls are always real and billed** "
+        "(Africa's Talking's Voice API has no free sandbox mode) — test with your own number first. "
         "Requires `AT_USERNAME`, `AT_API_KEY` (and `AT_VOICE_CALLER_ID` for calls) in Streamlit secrets."
     )
 
