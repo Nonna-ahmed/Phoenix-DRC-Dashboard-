@@ -226,18 +226,25 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
     fetch what to actually say — the message + language are passed through as
     clientState so the backend (congo_api.py) knows what to speak.
 
-    NOTE: unlike SMS, Africa's Talking's Voice API has no free sandbox mode —
-    "voice.sandbox.africastalking.com" doesn't exist (it was a docs error /
-    deprecated endpoint, which is why it failed DNS resolution). ALL voice
-    calls go through the live endpoint and are billed for real, even with a
-    sandbox username/app. Test with your own number first."""
+    NOTE: Africa's Talking's Voice API does NOT accept sandbox credentials at
+    all (unlike SMS, which works fine in sandbox) — it requires a real, live
+    production app username + API key. That's also why there's no
+    "voice.sandbox.africastalking.com" — it doesn't exist. Set
+    AT_VOICE_USERNAME / AT_VOICE_API_KEY in Streamlit secrets to your
+    production app's credentials; if those aren't set, this falls back to
+    AT_USERNAME / AT_API_KEY (which will fail if those are still "sandbox")."""
     import json
 
-    username = st.secrets.get("AT_USERNAME")
-    api_key = st.secrets.get("AT_API_KEY")
+    username = st.secrets.get("AT_VOICE_USERNAME") or st.secrets.get("AT_USERNAME")
+    api_key = st.secrets.get("AT_VOICE_API_KEY") or st.secrets.get("AT_API_KEY")
     caller_id = st.secrets.get("AT_VOICE_CALLER_ID")  # virtual number Africa's Talking issues for Voice
     if not username or not api_key or not caller_id:
-        return {"error": "AT_USERNAME / AT_API_KEY / AT_VOICE_CALLER_ID not set in Streamlit secrets."}
+        return {"error": "AT_VOICE_USERNAME / AT_VOICE_API_KEY / AT_VOICE_CALLER_ID not set in Streamlit secrets "
+                          "(or AT_USERNAME / AT_API_KEY as a fallback)."}
+    if username == "sandbox":
+        return {"error": "Africa's Talking Voice doesn't accept sandbox credentials. Create a live production "
+                          "app in the Africa's Talking dashboard and set AT_VOICE_USERNAME / AT_VOICE_API_KEY "
+                          "in Streamlit secrets to that app's username/API key."}
 
     url = "https://voice.africastalking.com/call"
     try:
@@ -296,9 +303,10 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                     st.success(f"Call placed! Response: {voice_result}")
 
     st.caption(
-        "⚠️ SMS sends for free in the Sandbox, but **voice calls are always real and billed** "
-        "(Africa's Talking's Voice API has no free sandbox mode) — test with your own number first. "
-        "Requires `AT_USERNAME`, `AT_API_KEY` (and `AT_VOICE_CALLER_ID` for calls) in Streamlit secrets."
+        "⚠️ SMS sends for free in the Sandbox. **Voice calls require a live production Africa's "
+        "Talking app** (sandbox credentials aren't accepted for Voice at all) — set "
+        "`AT_VOICE_USERNAME` / `AT_VOICE_API_KEY` / `AT_VOICE_CALLER_ID` in Streamlit secrets, and "
+        "test with your own number first since every call is billed for real."
     )
 
     st.markdown(
