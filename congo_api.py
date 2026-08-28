@@ -1,9 +1,14 @@
 """
-Congo (Katanga) Backend API — FastAPI
-=========================================
-Same structure as the Algeria api.py, pointed at the Congo model and
-shelters database. Reuses risk_engine.py and air_quality.py as-is
-(both are region-agnostic).
+Congo API — PHOENIX Backend (Katanga, DRC)
+=============================================
+Single FastAPI service for the PHOENIX wildfire early-warning & shelter-
+matching system. This file merges what used to be two separate services:
+
+  - congo_api.py           -> current-conditions monitoring, shelters, alerts
+  - congo_forecast_api.py  -> future prediction using climatology
+
+...into one app, so there is only one backend to deploy and one base URL
+for both the dashboard and Africa's Talking (USSD/Voice) to call.
 
 Run locally:
     pip install -r requirements.txt
@@ -11,58 +16,125 @@ Run locally:
 
 Then open http://127.0.0.1:8000/docs for interactive API docs.
 
-Endpoints:
+Endpoints
+---------
+Current monitoring (historical / latest recorded weather):
     GET  /health
     POST /predict
     GET  /risk-map?date=YYYY-MM-DD
     GET  /shelters
     GET  /shelters/nearest
     GET  /alerts?date=YYYY-MM-DD
-    POST /ussd    (Africa's Talking USSD callback — bilingual EN/FR menu,
-                   works from any basic phone, no internet/app needed)
-    POST /voice   (Africa's Talking Voice callback — speaks the alert text
-                   passed in clientState when the dashboard places a call)
+
+Future forecast (climatology — historical average for the same day-of-year):
+    POST /predict-future           single point, future date
+    GET  /risk-map-future          full grid, future date
+    POST /predict-forecast-live    optional live weather forecast (OpenWeatherMap),
+                                    falls back to climatology if no API key
+
+Africa's Talking webhooks:
+    POST /ussd    USSD callback — bilingual EN/FR menu, works from any basic
+                  phone with no internet/app. Reports the FORECAST (not the
+                  latest historical reading) for today, so it always reflects
+                  a prediction rather than old recorded data.
+    POST /voice   Voice callback — speaks the alert text passed in
+                  clientState when the dashboard places a call.
 """
 
-from datetime import date as date_type
+from datetime import date as date_type, timedelta
 from math import radians, sin, cos, sqrt, atan2
-from typing import Optional, List
+from typing import Optional, List, Dict
 import json
+import os
 
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
-from congo_predict import predict_fire_risk
 from risk_engine import get_alert
 from air_quality import fetch_live_pm25
 
 # -----------------------------------------------------------------
-# App & data loading
+# Predictor — use congo_predict if available, fall back to a simple
+# rule-based score otherwise so the API never fails to start.
+# -----------------------------------------------------------------
+try:
+    from congo_predict import predict_fire_risk
+    HAS_CONGO_PREDICT = True
+except ImportError:
+    HAS_CONGO_PREDICT = False
+    predict_fire_risk = None
+
+
+def dummy_predict_fire_risk(**kwargs) -> dict:
+    """Simple rule-based fallback used only if congo_predict.py is missing."""
+    t_max = kwargs.get("t2m_max", 30)
+    rh = kwargs.get("rh2m", 50)
+    ws = kwargs.get("ws2m", 3)
+    prectot = kwargs.get("prectotcorr", 0)
+
+    score = 0.0
+    score += max(0, (t_max - 20) / 30) * 0.35      # temperature contribution
+    score += max(0, (100 - rh) / 100) * 0.30       # humidity contribution
+    score += min(ws / 15, 1.0) * 0.20              # wind contribution
+    score += (1 - min(prectot / 10, 1.0)) * 0.15   # rain contribution (inverse)
+
+    prob = min(max(score, 0.0), 1.0)
+    if prob >= 0.7:
+        level = "High"
+    elif prob >= 0.4:
+        level = "Moderate"
+    else:
+        level = "Low"
+    return {"fire_probability": round(prob, 4), "risk_level": level}
+
+
+def call_predict(**kwargs) -> dict:
+    """Single entry point for fire-risk prediction used across every
+    endpoint — uses congo_predict when available, otherwise the fallback."""
+    if HAS_CONGO_PREDICT and predict_fire_risk is not None:
+        return predict_fire_risk(**kwargs)
+    return dummy_predict_fire_risk(**kwargs)
+
+
+# -----------------------------------------------------------------
+# App
 # -----------------------------------------------------------------
 app = FastAPI(
-    title="PHOENIX API — Congo (Katanga)",
-    description="Wildfire early-warning & shelter-matching API for Haut-Katanga, Lualaba & Tanganyika (DRC)",
-    version="1.0.0",
+    title="Congo API — PHOENIX (Katanga)",
+    description="Wildfire early-warning, forecast & shelter-matching API for "
+                "Haut-Katanga, Lualaba & Tanganyika (DRC)",
+    version="2.0.0",
 )
 
-CLIMATE_DF = pd.read_csv("phoenix_climate_2020_2026.csv")
+# -----------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------
+CLIMATE_CSV = "phoenix_climate_2020_2026.csv"
+if not os.path.exists(CLIMATE_CSV):
+    raise FileNotFoundError(
+        f"Climate file not found: {CLIMATE_CSV}. Place it next to this script."
+    )
+
+CLIMATE_DF = pd.read_csv(CLIMATE_CSV)
 CLIMATE_DF = CLIMATE_DF.dropna(subset=["YEAR", "DOY"])  # a few rows have genuinely missing YEAR/DOY
 CLIMATE_DF["YEAR"] = CLIMATE_DF["YEAR"].astype(int)
 CLIMATE_DF["DOY"] = CLIMATE_DF["DOY"].astype(int)
 CLIMATE_DF["date"] = pd.to_datetime(CLIMATE_DF["YEAR"].astype(str), format="%Y") + \
                       pd.to_timedelta(CLIMATE_DF["DOY"] - 1, unit="D")
+
 # NASA POWER has a ~3-5 day processing lag; unprocessed recent days come back
 # as the fill value -999 instead of real numbers. Mark those as NaN (don't
 # drop the row) so the date itself still counts as "available" — /risk-map
-# reports "No data" for the specific points that are missing, instead of
-# silently rolling the whole default date back to an older, fully-clean one.
+# reports "No data" for the specific points that are missing, and the
+# climatology engine's averages simply ignore NaN automatically.
 _weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
 CLIMATE_DF[_weather_cols] = CLIMATE_DF[_weather_cols].where(CLIMATE_DF[_weather_cols] >= -900)
 
-# True latest date in the data (not the latest date with full grid coverage —
-# individual missing points are handled per-row in /risk-map instead).
+# True latest date in the historical data (used by /risk-map and /alerts —
+# the "current monitoring" view, not the forecast).
 LATEST_AVAILABLE_DATE = CLIMATE_DF["date"].max().normalize()
 
 SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
@@ -78,10 +150,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
-# Reference point per province, used by the USSD menu to give a quick risk +
-# nearest-shelter summary without needing the caller's GPS location (basic
-# phones on USSD have none). Same towns used as reference points in the
-# Streamlit dashboard's "Nearest Shelters" panel.
+# Reference point per province, used by the USSD menu to give a quick
+# forecast + nearest-shelter summary without needing the caller's GPS
+# location (basic phones on USSD have none). Same towns used as reference
+# points in the Streamlit dashboard's "Nearest Shelters" panel.
 PROVINCE_REF_POINTS = {
     "Haut-Katanga": (-11.6609, 27.4794),   # Lubumbashi
     "Lualaba": (-10.7167, 25.4667),        # Kolwezi
@@ -90,7 +162,62 @@ PROVINCE_REF_POINTS = {
 
 
 # -----------------------------------------------------------------
-# Request / response schemas
+# Climatology engine — historical average for a given day-of-year,
+# used for every FUTURE date prediction (no live weather data exists
+# for dates that haven't happened yet).
+# -----------------------------------------------------------------
+class ClimatologyEngine:
+    """Computes the historical average weather for each (LAT, LON) grid
+    cell, for a given day-of-year, across every year available in the data."""
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.copy()
+        self.df["doy"] = self.df["date"].dt.dayofyear
+
+    def get_climatology_for_doy(self, doy: int) -> pd.DataFrame:
+        same_doy = self.df[self.df["doy"] == doy]
+        if same_doy.empty:
+            raise ValueError(f"No historical data for day-of-year={doy}")
+        grouped = same_doy.groupby(["LAT", "LON"]).agg({
+            "T2M_MAX": "mean", "T2M_MIN": "mean", "RH2M": "mean",
+            "WS2M": "mean", "PRECTOTCORR": "mean",
+        }).reset_index()
+        grouped["DOY"] = doy
+        return grouped
+
+    def get_climatology_for_date(self, target_date: date_type) -> pd.DataFrame:
+        doy = target_date.timetuple().tm_yday
+        return self.get_climatology_for_doy(doy)
+
+    def get_point_climatology(self, lat: float, lon: float, target_date: date_type) -> Dict:
+        doy = target_date.timetuple().tm_yday
+        same_doy = self.df[self.df["doy"] == doy]
+        if same_doy.empty:
+            raise ValueError(f"No historical data for day-of-year={doy}")
+
+        same_doy = same_doy.copy()
+        same_doy["dist"] = np.sqrt((same_doy["LAT"] - lat) ** 2 + (same_doy["LON"] - lon) ** 2)
+        nearest = same_doy.loc[same_doy["dist"].idxmin()]
+        point_data = same_doy[(same_doy["LAT"] == nearest["LAT"]) & (same_doy["LON"] == nearest["LON"])]
+        if point_data.empty:
+            raise ValueError(f"No data for point ({lat}, {lon})")
+
+        return {
+            "lat": float(nearest["LAT"]), "lon": float(nearest["LON"]), "doy": doy,
+            "t2m_max": float(point_data["T2M_MAX"].mean()),
+            "t2m_min": float(point_data["T2M_MIN"].mean()),
+            "rh2m": float(point_data["RH2M"].mean()),
+            "ws2m": float(point_data["WS2M"].mean()),
+            "prectotcorr": float(point_data["PRECTOTCORR"].mean()),
+            "historical_years": int(point_data["YEAR"].nunique()),
+        }
+
+
+CLIM_ENGINE = ClimatologyEngine(CLIMATE_DF)
+
+
+# -----------------------------------------------------------------
+# Request / response schemas — current monitoring
 # -----------------------------------------------------------------
 class PredictRequest(BaseModel):
     lat: float = Field(..., json_schema_extra={"example": -9.9})
@@ -143,16 +270,75 @@ class AlertOut(BaseModel):
 
 
 # -----------------------------------------------------------------
-# Endpoints
+# Request / response schemas — future forecast
 # -----------------------------------------------------------------
+class PredictFutureRequest(BaseModel):
+    lat: float = Field(..., json_schema_extra={"example": -9.9})
+    lon: float = Field(..., json_schema_extra={"example": 27.5})
+    date: str = Field(..., description="Future date YYYY-MM-DD, e.g. 2026-09-15")
+
+
+class PredictFutureResponse(BaseModel):
+    lat: float
+    lon: float
+    date: str
+    doy: int
+    t2m_max: float
+    t2m_min: float
+    rh2m: float
+    ws2m: float
+    prectotcorr: float
+    fire_probability: float
+    risk_level: str
+    method: str = "climatology"
+    historical_years: int
+
+
+class RiskMapFutureResponse(BaseModel):
+    lat: float
+    lon: float
+    fire_probability: float
+    risk_level: str
+    t2m_max: float
+    rh2m: float
+
+
+class ForecastLiveRequest(BaseModel):
+    lat: float = Field(..., json_schema_extra={"example": -9.9})
+    lon: float = Field(..., json_schema_extra={"example": 27.5})
+    date: str = Field(..., description="Future date YYYY-MM-DD")
+    api_key: Optional[str] = Field(None, description="OpenWeatherMap API key (optional)")
+
+
+class ForecastLiveResponse(BaseModel):
+    lat: float
+    lon: float
+    date: str
+    fire_probability: float
+    risk_level: str
+    weather_source: str
+    temp_max: float
+    humidity: float
+    wind_speed: float
+    rain_probability: Optional[float] = None
+
+
+# ===================================================================
+# Current-monitoring endpoints
+# ===================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "PHOENIX API — Congo (Katanga)", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "service": "Congo API — PHOENIX (Katanga)",
+        "version": "2.0.0",
+        "predictor": "congo_predict" if HAS_CONGO_PREDICT else "dummy_fallback",
+    }
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
-    return predict_fire_risk(
+    return call_predict(
         lat=req.lat, lon=req.lon, doy=req.doy,
         t2m_max=req.t2m_max, t2m_min=req.t2m_min,
         rh2m=req.rh2m, ws2m=req.ws2m, prectotcorr=req.prectotcorr,
@@ -161,8 +347,9 @@ def predict(req: PredictRequest):
 
 @app.get("/risk-map", response_model=List[dict])
 def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12")):
-    """Fire risk for every grid cell. Health/AQI fields only populate for the
-    LATEST available weather date (live data source), same rule as Algeria."""
+    """Fire risk for every grid cell using RECORDED weather. Health/AQI
+    fields only populate for the latest available historical date (live
+    data source)."""
     day_data = CLIMATE_DF[CLIMATE_DF["date"] == pd.Timestamp(date)]
     if day_data.empty:
         raise HTTPException(status_code=404, detail="No climate data available for this date.")
@@ -178,7 +365,7 @@ def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 20
                 "pm2_5": None, "health_level": None, "health_advice": None,
             })
             continue
-        r = predict_fire_risk(
+        r = call_predict(
             lat=row["LAT"], lon=row["LON"], doy=doy,
             t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
             rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
@@ -265,15 +452,157 @@ def alerts(date: date_type = Query(..., description="Date to evaluate, e.g. 2026
         })
     return out
 
-# -----------------------------------------------------------------
+
+# ===================================================================
+# Future-forecast endpoints (climatology)
+# ===================================================================
+@app.post("/predict-future", response_model=PredictFutureResponse)
+def predict_future(req: PredictFutureRequest):
+    """Predicts fire risk at a single point for a FUTURE date, using the
+    historical climatology average for that day-of-year."""
+    try:
+        target_date = date_type.fromisoformat(req.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    try:
+        clim = CLIM_ENGINE.get_point_climatology(req.lat, req.lon, target_date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    result = call_predict(
+        lat=clim["lat"], lon=clim["lon"], doy=clim["doy"],
+        t2m_max=clim["t2m_max"], t2m_min=clim["t2m_min"],
+        rh2m=clim["rh2m"], ws2m=clim["ws2m"], prectotcorr=clim["prectotcorr"],
+    )
+
+    return PredictFutureResponse(
+        lat=clim["lat"], lon=clim["lon"], date=req.date, doy=clim["doy"],
+        t2m_max=round(clim["t2m_max"], 2), t2m_min=round(clim["t2m_min"], 2),
+        rh2m=round(clim["rh2m"], 2), ws2m=round(clim["ws2m"], 2),
+        prectotcorr=round(clim["prectotcorr"], 4),
+        fire_probability=result["fire_probability"], risk_level=result["risk_level"],
+        method="climatology", historical_years=clim["historical_years"],
+    )
+
+
+@app.get("/risk-map-future", response_model=List[RiskMapFutureResponse])
+def risk_map_future(date: date_type = Query(..., description="Future date to predict, e.g. 2026-09-15")):
+    """Full-grid fire risk forecast for a FUTURE date, using climatology."""
+    try:
+        clim_df = CLIM_ENGINE.get_climatology_for_date(date)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    results = []
+    for _, row in clim_df.iterrows():
+        r = call_predict(
+            lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
+            t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
+            rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+        )
+        results.append(RiskMapFutureResponse(
+            lat=row["LAT"], lon=row["LON"],
+            fire_probability=r["fire_probability"], risk_level=r["risk_level"],
+            t2m_max=round(row["T2M_MAX"], 2), rh2m=round(row["RH2M"], 2),
+        ))
+    return results
+
+
+@app.post("/predict-forecast-live", response_model=ForecastLiveResponse)
+def predict_forecast_live(req: ForecastLiveRequest):
+    """Predicts using a REAL weather forecast (OpenWeatherMap) if an API key
+    is supplied; falls back to climatology otherwise."""
+    try:
+        target_date = date_type.fromisoformat(req.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+
+    weather = None
+    if req.api_key:
+        try:
+            import requests
+            url = (
+                f"https://api.openweathermap.org/data/2.5/forecast"
+                f"?lat={req.lat}&lon={req.lon}&appid={req.api_key}&units=metric"
+            )
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                target_ts = pd.Timestamp(target_date)
+                best, best_diff = None, timedelta(days=999)
+                for item in data.get("list", []):
+                    item_dt = pd.Timestamp(item["dt"], unit="s")
+                    diff = abs(item_dt - target_ts)
+                    if diff < best_diff:
+                        best_diff, best = diff, item
+                if best:
+                    main = best["main"]
+                    wind = best.get("wind", {})
+                    rain = best.get("rain", {})
+                    weather = {
+                        "t2m_max": main.get("temp_max", main.get("temp", 30)),
+                        "t2m_min": main.get("temp_min", main.get("temp", 20)),
+                        "rh2m": main.get("humidity", 50),
+                        "ws2m": wind.get("speed", 3),
+                        "prectotcorr": rain.get("3h", 0) if rain else 0,
+                        "source": "openweathermap",
+                        "rain_prob": best.get("pop", None),
+                    }
+        except Exception:
+            weather = None
+
+    if weather is None:
+        try:
+            clim = CLIM_ENGINE.get_point_climatology(req.lat, req.lon, target_date)
+            weather = {
+                "t2m_max": clim["t2m_max"], "t2m_min": clim["t2m_min"],
+                "rh2m": clim["rh2m"], "ws2m": clim["ws2m"],
+                "prectotcorr": clim["prectotcorr"],
+                "source": "climatology_fallback", "rain_prob": None,
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    doy = target_date.timetuple().tm_yday
+    result = call_predict(
+        lat=req.lat, lon=req.lon, doy=doy,
+        t2m_max=weather["t2m_max"], t2m_min=weather["t2m_min"],
+        rh2m=weather["rh2m"], ws2m=weather["ws2m"], prectotcorr=weather["prectotcorr"],
+    )
+
+    return ForecastLiveResponse(
+        lat=req.lat, lon=req.lon, date=req.date,
+        fire_probability=result["fire_probability"], risk_level=result["risk_level"],
+        weather_source=weather["source"],
+        temp_max=round(weather["t2m_max"], 2), humidity=round(weather["rh2m"], 2),
+        wind_speed=round(weather["ws2m"], 2),
+        rain_probability=round(weather["rain_prob"], 2) if weather["rain_prob"] is not None else None,
+    )
+
+
+# ===================================================================
 # USSD & Voice — Africa's Talking webhooks
-# -----------------------------------------------------------------
-def _ussd_summary(lat: float, lon: float, lang: str) -> str:
-    """Current high-risk zone count + nearest available shelter, in the
-    requested language. Reuses /risk-map for the latest date so USSD/Voice
-    always match what the dashboard shows."""
-    zones = risk_map(LATEST_AVAILABLE_DATE.date())
-    high_count = sum(1 for z in zones if z["risk_level"] == "High")
+# ===================================================================
+def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
+    """High-risk zone count FORECAST for today (via climatology) + nearest
+    available shelter, in the requested language. Uses the climatology
+    engine for today's date rather than the historical CSV's latest recorded
+    reading, so USSD/Voice always reflect a forecast, not old recorded data."""
+    target_date = date_type.today()
+    high_count = 0
+    try:
+        clim_df = CLIM_ENGINE.get_climatology_for_date(target_date)
+        for _, row in clim_df.iterrows():
+            r = call_predict(
+                lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
+                t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
+                rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+            )
+            if r["risk_level"] == "High":
+                high_count += 1
+    except ValueError:
+        pass  # no historical data for this day-of-year — report 0 and continue
 
     shelters = SHELTERS_DF[(SHELTERS_DF["is_shelter"]) & (SHELTERS_DF["available"] > 0)].copy()
     nearest_name, nearest_dist = None, None
@@ -284,16 +613,16 @@ def _ussd_summary(lat: float, lon: float, lang: str) -> str:
         nearest = shelters.loc[shelters["distance_km"].idxmin()]
         nearest_name, nearest_dist = nearest["name"], round(nearest["distance_km"], 1)
 
-    date_str = LATEST_AVAILABLE_DATE.strftime("%Y-%m-%d")
+    date_str = target_date.strftime("%Y-%m-%d")
     if lang == "fr":
         shelter_line = (f"Abri le plus proche: {nearest_name} ({nearest_dist} km)"
                          if nearest_name else "Aucun abri disponible trouve.")
-        return (f"PHOENIX - Alerte Incendie ({date_str})\n"
-                f"Zones a haut risque: {high_count}\n{shelter_line}\nRestez en securite.")
+        return (f"PHOENIX - Prevision Incendie ({date_str})\n"
+                f"Zones a haut risque (prevues): {high_count}\n{shelter_line}\nRestez en securite.")
     shelter_line = (f"Nearest shelter: {nearest_name} ({nearest_dist} km)"
                      if nearest_name else "No available shelter found.")
-    return (f"PHOENIX - Fire Alert ({date_str})\n"
-            f"High-risk zones: {high_count}\n{shelter_line}\nStay safe.")
+    return (f"PHOENIX - Fire Forecast ({date_str})\n"
+            f"High-risk zones (forecast): {high_count}\n{shelter_line}\nStay safe.")
 
 
 @app.post("/ussd")
@@ -301,7 +630,8 @@ async def ussd(request: Request):
     """Africa's Talking USSD callback. Register a USSD channel in the
     Africa's Talking console pointed at this URL — anyone can then dial the
     assigned code from ANY phone (no smartphone, app, or internet needed) to
-    check current fire risk and the nearest shelter, in English or French.
+    check the fire risk FORECAST and the nearest shelter, in English or
+    French.
 
     Protocol: Africa's Talking POSTs form-encoded sessionId / serviceCode /
     phoneNumber / text. `text` accumulates the caller's choices separated by
@@ -327,10 +657,10 @@ async def ussd(request: Request):
         else:
             ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
             try:
-                summary = _ussd_summary(ref_lat, ref_lon, lang)
+                summary = _ussd_forecast_summary(ref_lat, ref_lon, lang)
             except Exception:
-                summary = ("No data available right now. Try again later." if lang == "en"
-                           else "Aucune donnee disponible. Reessayez plus tard.")
+                summary = ("No forecast available right now. Try again later." if lang == "en"
+                           else "Aucune prevision disponible. Reessayez plus tard.")
             response = f"END {summary}"
     else:
         response = "END Session error. Please try again. / Erreur de session. Reessayez."
