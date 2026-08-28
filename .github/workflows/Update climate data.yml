@@ -4,12 +4,15 @@ on:
   schedule:
     # Runs daily at 03:00 UTC. NASA POWER's own processing lag means the
     # most recent 3-5 days will still show as missing right after this
-    # runs — that's expected, not a failure of this workflow.
+    # runs — that's expected, not a failure of this workflow. Air quality
+    # changes faster than climate; if you want it refreshed more often,
+    # add a second cron entry here (e.g. "0 */6 * * *" for every 6 hours)
+    # and skip the climate step on those extra runs.
     - cron: "0 3 * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
-  contents: write   # needed so the workflow can commit the updated CSV
+  contents: write   # needed so the workflow can commit the updated CSVs
 
 jobs:
   update-data:
@@ -26,17 +29,20 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests
 
-      - name: Fetch latest NASA POWER data
+      - name: Fetch latest NASA POWER climate data
         run: python update_climate_data.py
+
+      - name: Fetch latest shelter air quality
+        run: python update_shelter_air_quality.py
 
       - name: Commit and push if the data changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- phoenix_climate_2020_2026.csv; then
+          if git diff --quiet -- phoenix_climate_2020_2026.csv drc_katanga_shelters_final.csv; then
             echo "No changes to commit."
           else
-            git add phoenix_climate_2020_2026.csv
-            git commit -m "Auto-update climate data ($(date -u +'%Y-%m-%d'))"
+            git add phoenix_climate_2020_2026.csv drc_katanga_shelters_final.csv
+            git commit -m "Auto-update climate & air quality data ($(date -u +'%Y-%m-%d'))"
             git push
           fi
