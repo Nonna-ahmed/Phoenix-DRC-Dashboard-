@@ -1,0 +1,42 @@
+name: Update climate data
+
+on:
+  schedule:
+    # Runs daily at 03:00 UTC. NASA POWER's own processing lag means the
+    # most recent 3-5 days will still show as missing right after this
+    # runs — that's expected, not a failure of this workflow.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated CSV
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Fetch latest NASA POWER data
+        run: python update_climate_data.py
+
+      - name: Commit and push if the data changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- phoenix_climate_2020_2026.csv; then
+            echo "No changes to commit."
+          else
+            git add phoenix_climate_2020_2026.csv
+            git commit -m "Auto-update climate data ($(date -u +'%Y-%m-%d'))"
+            git push
+          fi
