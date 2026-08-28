@@ -209,6 +209,41 @@ def build_alert_message(count: int, date_str: str, lang: str) -> str:
     return _ALERT_TEMPLATES[lang].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
 
 
+_ZONE_ALERT_TEMPLATES = {
+    "en": "[PHOENIX ALERT] High wildfire risk at ({lat}, {lon}). Risk: {risk} ({prob}). "
+          "{aqi} Nearest shelter: {shelter} ({dist}). Move now. Dial {ussd} for more info "
+          "— no internet needed.",
+    "fr": "[ALERTE PHOENIX] Risque élevé d'incendie à ({lat}, {lon}). Risque : {risk} ({prob}). "
+          "{aqi} Abri le plus proche : {shelter} ({dist}). Déplacez-vous maintenant. Composez "
+          "{ussd} pour plus d'infos — sans internet.",
+}
+
+
+def build_zone_alert_message(zone: dict, lang: str) -> str:
+    """Builds an alert message for ONE specific zone (the one the user clicked
+    on the map), including its risk level, air quality, and nearest shelter —
+    instead of a dashboard-wide zone count."""
+    def render(single_lang: str) -> str:
+        prob = f"{zone['fire_probability_pct']}%" if zone.get("fire_probability_pct") is not None else "N/A"
+        if zone.get("pm2_5") is not None:
+            aqi = (f"Air quality: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'})."
+                   if single_lang == "en" else
+                   f"Qualité de l'air : {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).")
+        else:
+            aqi = "Air quality: no live data." if single_lang == "en" else "Qualité de l'air : pas de données en direct."
+        shelter = zone.get("shelter_name") or ("Not found" if single_lang == "en" else "Introuvable")
+        dist = f"{zone['shelter_dist']:.1f} km" if zone.get("shelter_dist") is not None else "?"
+        return _ZONE_ALERT_TEMPLATES[single_lang].format(
+            lat=round(zone["lat"], 3), lon=round(zone["lon"], 3),
+            risk=zone.get("risk_level") or "N/A", prob=prob, aqi=aqi,
+            shelter=shelter, dist=dist, ussd=USSD_SERVICE_CODE,
+        )
+
+    if lang == "both":
+        return render("en") + "\n---\n" + render("fr")
+    return render(lang)
+
+
 def render_language_picker(key: str) -> str:
     """Renders a language selector and returns 'en' / 'fr' / 'both'."""
     choice = st.radio(
@@ -264,15 +299,27 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
         return {"error": str(e)}
 
 
-def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix: str):
+def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix: str, zone: dict = None):
     """Renders the full 'Send Real Alert' block: language picker, phone input,
-    SMS button, Voice call button, and a USSD info card. Shared by Tab 1 and Tab 2."""
-    st.subheader("📱☎️ Send Real Alert")
+    SMS button, Voice call button, and a USSD info card. Shared by Tab 1 and
+    Tab 2. If `zone` is given (a specific clicked risk zone with lat/lon/
+    risk_level/fire_probability_pct/pm2_5/health_level/shelter_name/
+    shelter_dist), the message targets that exact spot instead of the
+    dashboard-wide zone count."""
+    if zone:
+        st.subheader("📱☎️ Send Alert for Selected Zone")
+        st.caption(f"Targeting the zone at ({zone['lat']:.3f}, {zone['lon']:.3f}) — "
+                   f"{zone.get('risk_level') or 'N/A'} risk.")
+    else:
+        st.subheader("📱☎️ Send Real Alert")
 
     lang = render_language_picker(key=f"{key_prefix}_lang")
     recipient_input = st.text_input("Phone number (e.g. +243800000001)", key=f"{key_prefix}_recipient")
 
-    message = build_alert_message(zone_count, ref_date_str, lang)
+    if zone:
+        message = build_zone_alert_message(zone, lang)
+    else:
+        message = build_alert_message(zone_count, ref_date_str, lang)
 
     col_sms, col_voice = st.columns(2)
     with col_sms:
@@ -292,7 +339,8 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                 st.error("Enter the number in international format, e.g. +243800000001")
             else:
                 voice_lang = "en" if lang == "both" else lang
-                voice_message = build_alert_message(zone_count, ref_date_str, voice_lang)
+                voice_message = (build_zone_alert_message(zone, voice_lang) if zone
+                                  else build_alert_message(zone_count, ref_date_str, voice_lang))
                 with st.spinner("Placing call..."):
                     voice_result = send_voice_call_from_dashboard(
                         [recipient_input], voice_message, voice_lang
@@ -643,7 +691,55 @@ with tab1:
             f"out of {len(shelters)} matching your filters."
         )
 
-    st_folium(m, use_container_width=True, height=550, returned_objects=[])
+    map_data = st_folium(
+        m, use_container_width=True, height=550,
+        returned_objects=["last_active_drawing"],
+    )
+
+    # ---------------------------------------------------------------
+    # Zone selection (click a risk zone on the map above)
+    # ---------------------------------------------------------------
+    if "tab1_selected_zone" not in st.session_state:
+        st.session_state.tab1_selected_zone = None
+
+    clicked = map_data.get("last_active_drawing") if map_data else None
+    if clicked and clicked.get("geometry", {}).get("type") == "Point":
+        lon_c, lat_c = clicked["geometry"]["coordinates"]
+        props = clicked.get("properties", {})
+        if props.get("risk_level") is not None:  # only risk-zone features have this; ignore shelter markers
+            shelter_pool = shelters_all[shelters_all["is_shelter"]]
+            nearest = nearest_facility([lat_c], [lon_c], shelter_pool)
+            shelter_name = nearest.iloc[0]["name"] if not nearest.empty else None
+            shelter_dist = nearest.iloc[0]["distance_km"] if not nearest.empty else None
+            st.session_state.tab1_selected_zone = {
+                "lat": lat_c, "lon": lon_c,
+                "risk_level": props.get("risk_level"),
+                "fire_probability_pct": props.get("fire_probability_pct"),
+                "pm2_5": props.get("pm2_5"),
+                "health_level": props.get("health_level"),
+                "shelter_name": shelter_name,
+                "shelter_dist": shelter_dist,
+            }
+
+    zone = st.session_state.tab1_selected_zone
+    if zone:
+        st.markdown("### 📍 Selected Zone")
+        zc1, zc2, zc3 = st.columns(3)
+        zc1.metric("Risk Level", zone["risk_level"] or "N/A")
+        zc2.metric("Fire Probability",
+                   f"{zone['fire_probability_pct']}%" if zone["fire_probability_pct"] is not None else "N/A")
+        aqi_label = (f"{zone['pm2_5']:.0f} µg/m³ ({zone['health_level']})"
+                     if zone["pm2_5"] is not None else "No live data")
+        zc3.metric("Air Quality (PM2.5)", aqi_label)
+        if zone["shelter_name"]:
+            st.caption(f"🏠 Nearest shelter: **{zone['shelter_name']}** ({zone['shelter_dist']:.1f} km away)")
+        else:
+            st.caption("🏠 No nearby shelter found.")
+        if st.button("✕ Clear selection", key="tab1_clear_zone"):
+            st.session_state.tab1_selected_zone = None
+            st.rerun()
+    else:
+        st.caption("💡 Click a risk zone on the map to select it and send a targeted alert for that exact spot.")
 
     # ---------------------------------------------------------------
     # Nearest shelter & hospital table (for at-risk zones)
@@ -691,7 +787,8 @@ with tab1:
     # Real alert dispatch: SMS + Voice + USSD info (Africa's Talking)
     # ---------------------------------------------------------------
     tab1_high_count = int((res_df["risk_level"] == "High").sum())
-    render_alert_dispatch_section(tab1_high_count, latest_date_str, key_prefix="tab1")
+    render_alert_dispatch_section(tab1_high_count, latest_date_str, key_prefix="tab1",
+                                   zone=st.session_state.tab1_selected_zone)
 
 # =================================================================
 # TAB 2: Future Prediction (NEW!)
