@@ -44,5 +44,6 @@ jobs:
           else
             git add phoenix_climate_2020_2026.csv drc_katanga_shelters_final.csv
             git commit -m "Auto-update climate & air quality data ($(date -u +'%Y-%m-%d'))"
+            git pull --rebase --autostash origin main
             git push
           fi
