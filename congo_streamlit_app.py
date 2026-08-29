@@ -404,11 +404,20 @@ def load_shelters():
 
 climate = load_climate()
 
-# True latest date in the data. Individual points that are still NaN
-# (not yet processed by NASA POWER) are handled per-point as "No data"
-# by compute_results_for_date() — we don't roll the whole default date
-# back just because part of the grid isn't in yet.
-LATEST_AVAILABLE_DATE = climate["date"].max()
+# Default to the latest date where EVERY grid cell has complete data — no
+# NaN/"No data" on the default view. If the most recent day(s) still have
+# gaps from NASA POWER's processing lag, this rolls back to the most recent
+# fully-clean date instead. The person can still manually pick a newer,
+# partially-populated date with the slider below if they want to.
+_weather_cols_check = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
+_total_cells = climate[["LAT", "LON"]].drop_duplicates().shape[0]
+_complete_counts = (
+    climate.dropna(subset=_weather_cols_check)
+    .groupby("date").size()
+)
+_full_coverage_dates = _complete_counts[_complete_counts == _total_cells]
+LATEST_AVAILABLE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
+                          else climate["date"].max())
 shelters_all = load_shelters()
 
 # -------------------------------------------------------------
@@ -453,8 +462,9 @@ selected_date = st.sidebar.select_slider(
     format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"),
 )
 st.sidebar.caption(f"Defaulting to {pd.Timestamp(LATEST_AVAILABLE_DATE).strftime('%Y-%m-%d')} — "
-                    f"the most recent date in the data. Some grid points on this date may still "
-                    f"show 'No data' if NASA POWER hasn't finished processing them yet.")
+                    f"the most recent date with complete data for every grid cell. Newer dates may "
+                    f"exist but can still show 'No data' for some points if NASA POWER hasn't "
+                    f"finished processing them yet.")
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Risk thresholds**\n\n"
@@ -549,11 +559,21 @@ with tab1:
     is_latest_available = pd.Timestamp(selected_date).normalize() == pd.Timestamp(LATEST_AVAILABLE_DATE).normalize()
     latest_date_str = pd.Timestamp(LATEST_AVAILABLE_DATE).strftime("%Y-%m-%d")
 
+    # Open-Meteo's air-quality API only ever returns RIGHT NOW's live reading
+    # — it has no historical record. We still show it for any date within
+    # about the last year so it's usable while browsing recent history, but
+    # it's always today's live reading, never the actual historical air
+    # quality for an older selected date — the label below makes that clear
+    # instead of implying it's specific to the selected date.
+    days_from_latest = (pd.Timestamp(LATEST_AVAILABLE_DATE).normalize()
+                         - pd.Timestamp(selected_date).normalize()).days
+    show_live_aq = 0 <= days_from_latest <= 365
+
     res_df, aqi_fetch_success_count, _ = compute_results_for_date(
-        day_data.to_dict("records"), doy, is_latest_available
+        day_data.to_dict("records"), doy, show_live_aq
     )
 
-    if is_latest_available:
+    if show_live_aq:
         if aqi_fetch_success_count == 0:
             st.warning("🫁 **Air-quality data is temporarily unavailable** — could not reach the live "
                        "Open-Meteo service right now (this is a network hiccup, not a missing feature; "
@@ -563,11 +583,12 @@ with tab1:
             st.info(f"🫁 Live air-quality retrieved for {aqi_fetch_success_count}/{len(day_data)} zones "
                     f"(a few requests timed out — this is normal and will vary run to run).")
         else:
-            st.caption(f"🫁 Air-quality readings below are live (fetched just now, cached for 15 min). "
-                       f"Fire-risk inputs are from **{latest_date_str}** — the most recent weather data available.")
+            st.caption("🫁 Air-quality readings below are **live, right now** (fetched just now, cached "
+                       "for 15 min) — not historical for the selected date, since Open-Meteo only "
+                       f"provides current conditions. Fire-risk inputs are from **{latest_date_str}**.")
     else:
-        st.caption(f"ℹ️ Air-quality/health warnings are only shown for the most recent available date "
-                   f"(**{latest_date_str}**) — move the slider to the far right to see them.")
+        st.caption(f"ℹ️ Air-quality is only shown for dates within the last year of "
+                   f"**{latest_date_str}** — move the slider closer to the right to see it.")
 
     # Top metrics
     col1, col2, col3, col4 = st.columns(4)
