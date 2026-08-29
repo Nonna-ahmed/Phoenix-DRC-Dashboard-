@@ -802,15 +802,6 @@ with tab1:
             "Distances are approximate (haversine), not driving distance."
         )
 
-    st.markdown("---")
-
-    # ---------------------------------------------------------------
-    # Real alert dispatch: SMS + Voice + USSD info (Africa's Talking)
-    # ---------------------------------------------------------------
-    tab1_high_count = int((res_df["risk_level"] == "High").sum())
-    render_alert_dispatch_section(tab1_high_count, latest_date_str, key_prefix="tab1",
-                                   zone=st.session_state.tab1_selected_zone)
-
 # =================================================================
 # TAB 2: Future Prediction (NEW!)
 # =================================================================
