@@ -746,6 +746,34 @@ with tab1:
                 _route_latlon, color="#1976d2", weight=5, opacity=0.85,
                 tooltip=f"{_route_dist_km:.1f} km · ~{_route_dur_min:.0f} min ({_mode_label})",
             ).add_to(m)
+
+            # OSRM snaps the start/end to the nearest road IT knows about —
+            # in remote areas with incomplete OpenStreetMap road coverage,
+            # that snapped point can be a real gap away from the actual
+            # zone/shelter location. Close that visual gap with a dashed
+            # line so it's clear which part is a real mapped road vs. an
+            # off-road estimate, instead of the line just looking "cut off".
+            def _gap_km(lat1, lon1, lat2, lon2):
+                dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+                a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+                return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+            _route_start, _route_end = _route_latlon[0], _route_latlon[-1]
+            _start_gap = _gap_km(_route_start[0], _route_start[1], _sel["lat"], _sel["lon"])
+            _end_gap = _gap_km(_route_end[0], _route_end[1], _sel["shelter_lat"], _sel["shelter_lon"])
+            if _start_gap > 0.05:
+                folium.PolyLine(
+                    [[_sel["lat"], _sel["lon"]], _route_start],
+                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                    tooltip=f"Off-road (~{_start_gap:.1f} km) — no mapped road here, straight-line estimate",
+                ).add_to(m)
+            if _end_gap > 0.05:
+                folium.PolyLine(
+                    [_route_end, [_sel["shelter_lat"], _sel["shelter_lon"]]],
+                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                    tooltip=f"Off-road (~{_end_gap:.1f} km) — no mapped road here, straight-line estimate",
+                ).add_to(m)
+
             folium.Marker(
                 [_sel["lat"], _sel["lon"]],
                 icon=folium.Icon(color="red", icon="fire", prefix="fa"),
@@ -964,26 +992,39 @@ with tab2:
         tiles="OpenStreetMap"
     )
 
+    future_features = []
     for _, row in df_future.iterrows():
-        folium.CircleMarker(
-            location=[row["lat"], row["lon"]],
-            radius=5 + (row["fire_probability"] * 12),
-            popup=folium.Popup(
-                f"""
-                <b>📍 Location:</b> {row['lat']:.3f}, {row['lon']:.3f}<br>
-                <b>🔥 Probability:</b> {row['fire_probability']:.1%}<br>
-                <b>⚠️ Risk Level:</b> {row['risk_level']}<br>
-                <b>🌡️ Max Temp:</b> {row['t2m_max']:.1f}°C<br>
-                <b>💧 Humidity:</b> {row['rh2m']:.1f}%
-                """,
-                max_width=250,
-            ),
-            color=FUTURE_COLOR_MAP.get(row["risk_level"], "gray"),
-            fill=True,
-            fill_color=FUTURE_COLOR_MAP.get(row["risk_level"], "gray"),
-            fill_opacity=0.7,
-            weight=2,
-        ).add_to(m_future)
+        future_features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [row["lon"], row["lat"]]},
+            "properties": {
+                "risk_level": row["risk_level"],
+                "fire_probability_pct": f"{row['fire_probability']:.1%}",
+                "t2m_max": round(row["t2m_max"], 1),
+                "rh2m": round(row["rh2m"], 1),
+            },
+        })
+
+    def future_style_function(feature):
+        color = FUTURE_COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
+        return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
+
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": future_features},
+        name="Predicted risk zones",
+        marker=folium.CircleMarker(radius=12, fill=True),
+        style_function=future_style_function,
+        tooltip=folium.GeoJsonTooltip(
+            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
+            aliases=["Risk:", "Fire probability:", "Max temp (°C):", "Humidity (%):"],
+            sticky=True,
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
+            aliases=["⚠️ Risk Level:", "🔥 Probability:", "🌡️ Max Temp:", "💧 Humidity:"],
+            max_width=250,
+        ),
+    ).add_to(m_future)
 
     legend_html = """
     <div style="position: fixed; bottom: 50px; left: 50px; z-index: 9999; 
@@ -997,7 +1038,131 @@ with tab2:
     """
     m_future.get_root().html.add_child(folium.Element(legend_html))
 
-    st_folium(m_future, width="100%", height=600, returned_objects=[])
+    # Route from the selected zone (if any) to its nearest shelter — same
+    # approach as Tab 1: uses the PREVIOUS click's selection from
+    # session_state, since this run's own click is only known after
+    # st_folium returns below; the click handler triggers an immediate
+    # rerun so the route appears right away.
+    _sel2 = st.session_state.get("tab2_selected_zone")
+    if _sel2 and _sel2.get("shelter_lat") is not None:
+        _route_mode2 = st.session_state.get("tab2_route_mode", "foot")
+        _route_latlon2, _route_dist_km2, _route_dur_min2 = fetch_route(
+            _sel2["lat"], _sel2["lon"], _sel2["shelter_lat"], _sel2["shelter_lon"], profile=_route_mode2
+        )
+        if _route_latlon2:
+            _mode_label2 = "walking" if _route_mode2 == "foot" else "driving"
+            folium.PolyLine(
+                _route_latlon2, color="#1976d2", weight=5, opacity=0.85,
+                tooltip=f"{_route_dist_km2:.1f} km · ~{_route_dur_min2:.0f} min ({_mode_label2})",
+            ).add_to(m_future)
+
+            def _gap_km2(lat1, lon1, lat2, lon2):
+                dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+                a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+                return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+            _rstart2, _rend2 = _route_latlon2[0], _route_latlon2[-1]
+            _start_gap2 = _gap_km2(_rstart2[0], _rstart2[1], _sel2["lat"], _sel2["lon"])
+            _end_gap2 = _gap_km2(_rend2[0], _rend2[1], _sel2["shelter_lat"], _sel2["shelter_lon"])
+            if _start_gap2 > 0.05:
+                folium.PolyLine(
+                    [[_sel2["lat"], _sel2["lon"]], _rstart2],
+                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                    tooltip=f"Off-road (~{_start_gap2:.1f} km) — no mapped road here, straight-line estimate",
+                ).add_to(m_future)
+            if _end_gap2 > 0.05:
+                folium.PolyLine(
+                    [_rend2, [_sel2["shelter_lat"], _sel2["shelter_lon"]]],
+                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                    tooltip=f"Off-road (~{_end_gap2:.1f} km) — no mapped road here, straight-line estimate",
+                ).add_to(m_future)
+
+            folium.Marker(
+                [_sel2["lat"], _sel2["lon"]],
+                icon=folium.Icon(color="red", icon="fire", prefix="fa"),
+                tooltip="Selected zone",
+            ).add_to(m_future)
+            folium.Marker(
+                [_sel2["shelter_lat"], _sel2["shelter_lon"]],
+                icon=folium.Icon(color="green", icon="home", prefix="fa"),
+                tooltip=_sel2.get("shelter_name") or "Nearest shelter",
+            ).add_to(m_future)
+            st.session_state["tab2_route_info"] = {
+                "distance_km": _route_dist_km2, "duration_min": _route_dur_min2, "mode": _route_mode2,
+            }
+        else:
+            st.session_state["tab2_route_info"] = None
+
+    map_data_future = st_folium(
+        m_future, width="100%", height=600,
+        returned_objects=["last_active_drawing"],
+    )
+
+    # ---------------------------------------------------------------
+    # Zone selection (click a predicted risk zone on the map above)
+    # ---------------------------------------------------------------
+    if "tab2_selected_zone" not in st.session_state:
+        st.session_state.tab2_selected_zone = None
+    if "tab2_route_mode" not in st.session_state:
+        st.session_state.tab2_route_mode = "foot"
+    if "tab2_last_click_key" not in st.session_state:
+        st.session_state.tab2_last_click_key = None
+
+    clicked2 = map_data_future.get("last_active_drawing") if map_data_future else None
+    if clicked2 and clicked2.get("geometry", {}).get("type") == "Point":
+        lon_c2, lat_c2 = clicked2["geometry"]["coordinates"]
+        click_key2 = (round(lat_c2, 6), round(lon_c2, 6))
+        props2 = clicked2.get("properties", {})
+        if props2.get("risk_level") is not None and click_key2 != st.session_state.tab2_last_click_key:
+            st.session_state.tab2_last_click_key = click_key2
+            shelter_pool2 = shelters_all[shelters_all["is_shelter"]]
+            nearest2 = nearest_facility([lat_c2], [lon_c2], shelter_pool2)
+            shelter_name2 = nearest2.iloc[0]["name"] if not nearest2.empty else None
+            shelter_dist2 = nearest2.iloc[0]["distance_km"] if not nearest2.empty else None
+            shelter_lat2 = float(nearest2.iloc[0]["lat"]) if not nearest2.empty else None
+            shelter_lon2 = float(nearest2.iloc[0]["lon"]) if not nearest2.empty else None
+            st.session_state.tab2_selected_zone = {
+                "lat": lat_c2, "lon": lon_c2,
+                "risk_level": props2.get("risk_level"),
+                "fire_probability_pct": props2.get("fire_probability_pct"),
+                "shelter_name": shelter_name2,
+                "shelter_dist": shelter_dist2,
+                "shelter_lat": shelter_lat2,
+                "shelter_lon": shelter_lon2,
+            }
+            st.rerun()
+
+    zone2 = st.session_state.tab2_selected_zone
+    if zone2:
+        st.markdown("### 📍 Selected Zone (Forecast)")
+        zc1b, zc2b = st.columns(2)
+        zc1b.metric("Risk Level", zone2["risk_level"] or "N/A")
+        zc2b.metric("Fire Probability", zone2["fire_probability_pct"] or "N/A")
+        if zone2["shelter_name"]:
+            st.caption(f"🏠 Nearest shelter: **{zone2['shelter_name']}** ({zone2['shelter_dist']:.1f} km away, straight-line)")
+
+            mode_label2 = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab2_route_mode_radio")
+            new_mode2 = "foot" if "Walking" in mode_label2 else "driving"
+            if new_mode2 != st.session_state.tab2_route_mode:
+                st.session_state.tab2_route_mode = new_mode2
+                st.rerun()
+
+            route_info2 = st.session_state.get("tab2_route_info")
+            if route_info2:
+                mode_txt2 = "walking" if route_info2["mode"] == "foot" else "driving"
+                st.success(f"🛣️ Road route: **{route_info2['distance_km']:.1f} km**, "
+                           f"~**{route_info2['duration_min']:.0f} min** ({mode_txt2}) — shown on the map above.")
+            else:
+                st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
+                           "showing straight-line distance only.")
+        else:
+            st.caption("🏠 No nearby shelter found.")
+        if st.button("✕ Clear selection", key="tab2_clear_zone"):
+            st.session_state.tab2_selected_zone = None
+            st.session_state.tab2_route_info = None
+            st.rerun()
+    else:
+        st.caption("💡 Click a predicted risk zone on the map to see the route to its nearest shelter.")
 
     st.markdown("---")
 
