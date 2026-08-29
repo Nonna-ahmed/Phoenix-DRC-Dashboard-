@@ -58,12 +58,13 @@ def health_risk_level(pm2_5: Optional[float]) -> str:
     return "high"
 
 
-def health_advice_ar(level: str) -> str:
+def health_advice_text(level: str) -> str:
     return {
-        "low": "جودة الهواء مقبولة حاليًا.",
-        "medium": "جودة الهواء متوسطة — الفئات الحساسة (كبار السن، الأطفال، مرضى الجهاز التنفسي) عليهم الحذر.",
-        "high": "جودة الهواء خطيرة — يُنصح بالبقاء في مكان مغلق وتجنب المجهود الخارجي.",
-        "unknown": "بيانات جودة الهواء غير متوفرة حاليًا.",
+        "low": "Air quality is currently acceptable.",
+        "medium": "Air quality is moderate — sensitive groups (elderly, children, "
+                  "people with respiratory conditions) should take caution.",
+        "high": "Air quality is dangerous — stay indoors and avoid outdoor exertion.",
+        "unknown": "Air-quality data is not currently available.",
     }[level]
 
 
@@ -101,9 +102,9 @@ class SiteAlert:
     fire_probability: float
     pm2_5: Optional[float]
 
-    def sms_text_ar(self) -> str:
-        fire_label = {"low": "منخفضة", "medium": "متوسطة", "high": "عالية"}[self.fire_level]
-        lines = [f"⚠️ خطورة الحريق: {fire_label}."]
+    def sms_text(self) -> str:
+        fire_label = {"low": "Low", "medium": "Medium", "high": "High"}[self.fire_level]
+        lines = [f"⚠️ Fire risk: {fire_label}."]
         if self.health_level in ("medium", "high"):
             lines.append(self.health_advice)
         return " ".join(lines)
@@ -117,7 +118,7 @@ def get_alert(fire_probability: float, pm2_5: Optional[float]) -> SiteAlert:
     return SiteAlert(
         fire_level=f_level,
         health_level=h_level,
-        health_advice=health_advice_ar(h_level),
+        health_advice=health_advice_text(h_level),
         fire_probability=fire_probability,
         pm2_5=pm2_5,
     )
@@ -127,4 +128,4 @@ if __name__ == "__main__":
     # Quick sanity check
     example = get_alert(fire_probability=0.72, pm2_5=180)
     print(example)
-    print(example.sms_text_ar())
+    print(example.sms_text())
