@@ -133,9 +133,16 @@ CLIMATE_DF["date"] = pd.to_datetime(CLIMATE_DF["YEAR"].astype(str), format="%Y")
 _weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
 CLIMATE_DF[_weather_cols] = CLIMATE_DF[_weather_cols].where(CLIMATE_DF[_weather_cols] >= -900)
 
-# True latest date in the historical data (used by /risk-map and /alerts —
-# the "current monitoring" view, not the forecast).
-LATEST_AVAILABLE_DATE = CLIMATE_DF["date"].max().normalize()
+# Latest date with FULL grid coverage — no NaN for any point. Newer dates
+# may exist in the data but can still have partial "No data" from NASA
+# POWER's processing lag; /risk-map still reports those individually, but
+# LATEST_AVAILABLE_DATE (used as the "current" reference date by /alerts,
+# USSD forecast fallback, etc.) is the most recent FULLY clean date.
+_total_cells = CLIMATE_DF[["LAT", "LON"]].drop_duplicates().shape[0]
+_complete_counts = CLIMATE_DF.dropna(subset=_weather_cols).groupby("date").size()
+_full_coverage_dates = _complete_counts[_complete_counts == _total_cells]
+LATEST_AVAILABLE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
+                          else CLIMATE_DF["date"].max()).normalize()
 
 SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
 SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
@@ -348,13 +355,17 @@ def predict(req: PredictRequest):
 @app.get("/risk-map", response_model=List[dict])
 def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12")):
     """Fire risk for every grid cell using RECORDED weather. Health/AQI
-    fields only populate for the latest available historical date (live
-    data source)."""
+    fields populate for any date within the last year of LATEST_AVAILABLE_DATE
+    — Open-Meteo only ever returns the CURRENT live reading, never historical
+    air quality for the selected date, so this is always "right now", just
+    made available while browsing recent history rather than only on the
+    single most-recent date."""
     day_data = CLIMATE_DF[CLIMATE_DF["date"] == pd.Timestamp(date)]
     if day_data.empty:
         raise HTTPException(status_code=404, detail="No climate data available for this date.")
 
-    is_latest_available = pd.Timestamp(date).normalize() == LATEST_AVAILABLE_DATE
+    days_from_latest = (LATEST_AVAILABLE_DATE - pd.Timestamp(date).normalize()).days
+    show_live_aq = 0 <= days_from_latest <= 365
     doy = pd.Timestamp(date).dayofyear
     results = []
     for _, row in day_data.iterrows():
@@ -372,7 +383,7 @@ def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 20
         )
         entry = {"lat": row["LAT"], "lon": row["LON"], **r,
                   "pm2_5": None, "health_level": None, "health_advice": None}
-        if is_latest_available:
+        if show_live_aq:
             pm25 = fetch_live_pm25(row["LAT"], row["LON"])
             if pm25 is not None:
                 alert = get_alert(r["fire_probability"], pm25)
