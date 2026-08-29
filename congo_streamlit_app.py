@@ -97,6 +97,31 @@ def nearest_facility(zone_lats, zone_lons, cand_df):
     return matched
 
 
+def fetch_route(start_lat, start_lon, end_lat, end_lon, profile="foot"):
+    """Fetches a real road/path route between two points via OSRM's free
+    public demo server (no API key needed). profile: 'foot' (walking) or
+    'driving'. Returns (route_latlon_list, distance_km, duration_min), or
+    (None, None, None) on any failure — the public OSRM demo server is
+    best-effort/rate-limited, not guaranteed for heavy production use, so
+    callers should fall back to the straight-line distance already shown
+    elsewhere if this fails rather than blocking on it."""
+    url = (f"https://router.project-osrm.org/route/v1/{profile}/"
+           f"{start_lon},{start_lat};{end_lon},{end_lat}"
+           f"?overview=full&geometries=geojson")
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            return None, None, None
+        route = data["routes"][0]
+        coords = route["geometry"]["coordinates"]  # [[lon, lat], ...]
+        latlon = [[c[1], c[0]] for c in coords]
+        return latlon, route["distance"] / 1000, route["duration"] / 60
+    except Exception:
+        return None, None, None
+
+
 MAJOR_TOWNS = {
     "Lubumbashi (Haut-Katanga)": (-11.6609, 27.4794),
     "Kolwezi (Lualaba)": (-10.7167, 25.4667),
@@ -704,6 +729,39 @@ with tab1:
             tooltip=s["name"],
         ).add_to(shelter_cluster)
 
+    # Route from the selected zone (if any) to its nearest shelter. Uses the
+    # PREVIOUS click's selection from session_state — this run's own click
+    # (if any) is only known after st_folium returns further below, so the
+    # click handler triggers an immediate rerun to make the route appear
+    # right away instead of one interaction later.
+    _sel = st.session_state.get("tab1_selected_zone")
+    if _sel and _sel.get("shelter_lat") is not None:
+        _route_mode = st.session_state.get("tab1_route_mode", "foot")
+        _route_latlon, _route_dist_km, _route_dur_min = fetch_route(
+            _sel["lat"], _sel["lon"], _sel["shelter_lat"], _sel["shelter_lon"], profile=_route_mode
+        )
+        if _route_latlon:
+            _mode_label = "walking" if _route_mode == "foot" else "driving"
+            folium.PolyLine(
+                _route_latlon, color="#1976d2", weight=5, opacity=0.85,
+                tooltip=f"{_route_dist_km:.1f} km · ~{_route_dur_min:.0f} min ({_mode_label})",
+            ).add_to(m)
+            folium.Marker(
+                [_sel["lat"], _sel["lon"]],
+                icon=folium.Icon(color="red", icon="fire", prefix="fa"),
+                tooltip="Selected zone",
+            ).add_to(m)
+            folium.Marker(
+                [_sel["shelter_lat"], _sel["shelter_lon"]],
+                icon=folium.Icon(color="green", icon="home", prefix="fa"),
+                tooltip=_sel.get("shelter_name") or "Nearest shelter",
+            ).add_to(m)
+            st.session_state["tab1_route_info"] = {
+                "distance_km": _route_dist_km, "duration_min": _route_dur_min, "mode": _route_mode,
+            }
+        else:
+            st.session_state["tab1_route_info"] = None
+
     folium.LayerControl(position="topleft", collapsed=False).add_to(m)
 
     if len(shelters) > max_markers:
@@ -722,16 +780,28 @@ with tab1:
     # ---------------------------------------------------------------
     if "tab1_selected_zone" not in st.session_state:
         st.session_state.tab1_selected_zone = None
+    if "tab1_route_mode" not in st.session_state:
+        st.session_state.tab1_route_mode = "foot"
+    if "tab1_last_click_key" not in st.session_state:
+        st.session_state.tab1_last_click_key = None
 
     clicked = map_data.get("last_active_drawing") if map_data else None
     if clicked and clicked.get("geometry", {}).get("type") == "Point":
         lon_c, lat_c = clicked["geometry"]["coordinates"]
+        click_key = (round(lat_c, 6), round(lon_c, 6))
         props = clicked.get("properties", {})
-        if props.get("risk_level") is not None:  # only risk-zone features have this; ignore shelter markers
+        # Only act on risk-zone features (ignore shelter markers), and only
+        # on a NEW click — st_folium keeps returning the same last click on
+        # every rerun, and without this guard the st.rerun() below (which
+        # makes the route appear immediately) would loop forever.
+        if props.get("risk_level") is not None and click_key != st.session_state.tab1_last_click_key:
+            st.session_state.tab1_last_click_key = click_key
             shelter_pool = shelters_all[shelters_all["is_shelter"]]
             nearest = nearest_facility([lat_c], [lon_c], shelter_pool)
             shelter_name = nearest.iloc[0]["name"] if not nearest.empty else None
             shelter_dist = nearest.iloc[0]["distance_km"] if not nearest.empty else None
+            shelter_lat = float(nearest.iloc[0]["lat"]) if not nearest.empty else None
+            shelter_lon = float(nearest.iloc[0]["lon"]) if not nearest.empty else None
             st.session_state.tab1_selected_zone = {
                 "lat": lat_c, "lon": lon_c,
                 "risk_level": props.get("risk_level"),
@@ -740,7 +810,10 @@ with tab1:
                 "health_level": props.get("health_level"),
                 "shelter_name": shelter_name,
                 "shelter_dist": shelter_dist,
+                "shelter_lat": shelter_lat,
+                "shelter_lon": shelter_lon,
             }
+            st.rerun()  # redraw the map now, with the route included
 
     zone = st.session_state.tab1_selected_zone
     if zone:
@@ -753,14 +826,31 @@ with tab1:
                      if zone["pm2_5"] is not None else "No live data")
         zc3.metric("Air Quality (PM2.5)", aqi_label)
         if zone["shelter_name"]:
-            st.caption(f"🏠 Nearest shelter: **{zone['shelter_name']}** ({zone['shelter_dist']:.1f} km away)")
+            st.caption(f"🏠 Nearest shelter: **{zone['shelter_name']}** ({zone['shelter_dist']:.1f} km away, straight-line)")
+
+            mode_label = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab1_route_mode_radio")
+            new_mode = "foot" if "Walking" in mode_label else "driving"
+            if new_mode != st.session_state.tab1_route_mode:
+                st.session_state.tab1_route_mode = new_mode
+                st.rerun()
+
+            route_info = st.session_state.get("tab1_route_info")
+            if route_info:
+                mode_txt = "walking" if route_info["mode"] == "foot" else "driving"
+                st.success(f"🛣️ Road route: **{route_info['distance_km']:.1f} km**, "
+                           f"~**{route_info['duration_min']:.0f} min** ({mode_txt}) — shown on the map above.")
+            else:
+                st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
+                           "showing straight-line distance only.")
         else:
             st.caption("🏠 No nearby shelter found.")
         if st.button("✕ Clear selection", key="tab1_clear_zone"):
             st.session_state.tab1_selected_zone = None
+            st.session_state.tab1_route_info = None
             st.rerun()
     else:
-        st.caption("💡 Click a risk zone on the map to select it and send a targeted alert for that exact spot.")
+        st.caption("💡 Click a risk zone on the map to select it, see the route to its nearest shelter, "
+                   "and send a targeted alert for that exact spot.")
 
     # ---------------------------------------------------------------
     # Nearest shelter & hospital table (for at-risk zones)
