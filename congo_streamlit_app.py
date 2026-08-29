@@ -183,11 +183,11 @@ def send_sms_from_dashboard(recipients: list, message: str) -> dict:
 # -------------------------------------------------------------
 # Bilingual alert text (English / French)
 # -------------------------------------------------------------
-# USSD code assigned to this app by Africa's Talking once you register a
-# USSD channel pointed at {API_BASE_URL}/ussd (Sandbox gives you one
-# automatically; production requires applying with a DRC telecom regulator
-# — ARPTC). Replace this placeholder once you have the real code.
-USSD_SERVICE_CODE = "*XXX#"
+# USSD code assigned by Africa's Talking's Sandbox for this app's USSD
+# channel (pointed at {API_BASE_URL}/ussd). Production (real telecom
+# delivery, not just the Sandbox simulator) requires applying separately
+# with DRC's regulator — ARPTC — for a dedicated/shared code there.
+USSD_SERVICE_CODE = "*384*99838#"
 
 _ALERT_TEMPLATES = {
     "en": "[PHOENIX ALERT] High wildfire risk detected. {count} zone(s) currently High risk "
