@@ -19,6 +19,9 @@ import pandas as pd
 import numpy as np
 import folium
 import requests
+import time
+import json
+import io
 from folium.plugins import MarkerCluster, HeatMap
 from streamlit_folium import st_folium
 from math import radians, sin, cos, sqrt, atan2
@@ -222,15 +225,22 @@ _ALERT_TEMPLATES = {
           "haut risque au {date}. Déplacez le bétail/les biens de valeur maintenant. Pas de "
           "smartphone ? Composez {ussd} depuis n'importe quel téléphone pour les infos abris "
           "— sans internet.",
+    "sw": "[TAHADHARI YA PHOENIX] Hatari kubwa ya moto imegunduliwa. Maeneo {count} yana hatari "
+          "kubwa kufikia {date}. Hamisha mifugo/vitu vya thamani sasa. Huna simu janja? Piga "
+          "{ussd} kutoka simu yoyote kwa taarifa za makazi — hauitaji intaneti.",
 }
+
+_LANG_LABELS = {"en": "English", "fr": "Français", "sw": "Kiswahili"}
 
 
 def build_alert_message(count: int, date_str: str, lang: str) -> str:
-    """Builds the alert text in English, French, or both (lang: 'en', 'fr', 'both')."""
-    if lang == "both":
-        return (_ALERT_TEMPLATES["en"].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
-                 + "\n---\n" +
-                 _ALERT_TEMPLATES["fr"].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE))
+    """Builds the alert text in English, French, Swahili, or all three
+    (lang: 'en', 'fr', 'sw', 'all')."""
+    if lang == "all":
+        return "\n---\n".join(
+            _ALERT_TEMPLATES[l].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
+            for l in ("en", "fr", "sw")
+        )
     return _ALERT_TEMPLATES[lang].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
 
 
@@ -241,6 +251,9 @@ _ZONE_ALERT_TEMPLATES = {
     "fr": "[ALERTE PHOENIX] Risque élevé d'incendie à ({lat}, {lon}). Risque : {risk} ({prob}). "
           "{aqi} Abri le plus proche : {shelter} ({dist}). Déplacez-vous maintenant. Composez "
           "{ussd} pour plus d'infos — sans internet.",
+    "sw": "[TAHADHARI YA PHOENIX] Hatari kubwa ya moto karibu na ({lat}, {lon}). Hatari: {risk} "
+          "({prob}). {aqi} Makazi ya karibu: {shelter} ({dist}). Hamia sasa. Piga {ussd} kwa "
+          "maelezo zaidi — hauitaji intaneti.",
 }
 
 
@@ -251,33 +264,40 @@ def build_zone_alert_message(zone: dict, lang: str) -> str:
     def render(single_lang: str) -> str:
         prob = f"{zone['fire_probability_pct']}%" if zone.get("fire_probability_pct") is not None else "N/A"
         if zone.get("pm2_5") is not None:
-            aqi = (f"Air quality: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'})."
-                   if single_lang == "en" else
-                   f"Qualité de l'air : {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).")
+            aqi_texts = {
+                "en": f"Air quality: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
+                "fr": f"Qualité de l'air : {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
+                "sw": f"Ubora wa hewa: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
+            }
         else:
-            aqi = "Air quality: no live data." if single_lang == "en" else "Qualité de l'air : pas de données en direct."
-        shelter = zone.get("shelter_name") or ("Not found" if single_lang == "en" else "Introuvable")
+            aqi_texts = {
+                "en": "Air quality: no live data.",
+                "fr": "Qualité de l'air : pas de données en direct.",
+                "sw": "Ubora wa hewa: hakuna data ya sasa.",
+            }
+        not_found = {"en": "Not found", "fr": "Introuvable", "sw": "Haipatikani"}
+        shelter = zone.get("shelter_name") or not_found[single_lang]
         dist = f"{zone['shelter_dist']:.1f} km" if zone.get("shelter_dist") is not None else "?"
         return _ZONE_ALERT_TEMPLATES[single_lang].format(
             lat=round(zone["lat"], 3), lon=round(zone["lon"], 3),
-            risk=zone.get("risk_level") or "N/A", prob=prob, aqi=aqi,
+            risk=zone.get("risk_level") or "N/A", prob=prob, aqi=aqi_texts[single_lang],
             shelter=shelter, dist=dist, ussd=USSD_SERVICE_CODE,
         )
 
-    if lang == "both":
-        return render("en") + "\n---\n" + render("fr")
+    if lang == "all":
+        return "\n---\n".join(render(l) for l in ("en", "fr", "sw"))
     return render(lang)
 
 
 def render_language_picker(key: str) -> str:
-    """Renders a language selector and returns 'en' / 'fr' / 'both'."""
+    """Renders a language selector and returns 'en' / 'fr' / 'sw' / 'all'."""
     choice = st.radio(
-        "Alert language / Langue de l'alerte",
-        ["English", "Français", "Both / Les deux"],
+        "Alert language / Langue de l'alerte / Lugha ya tahadhari",
+        ["English", "Français", "Kiswahili", "All / Tous / Zote"],
         horizontal=True,
         key=key,
     )
-    return {"English": "en", "Français": "fr", "Both / Les deux": "both"}[choice]
+    return {"English": "en", "Français": "fr", "Kiswahili": "sw", "All / Tous / Zote": "all"}[choice]
 
 
 def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "en") -> dict:
@@ -363,7 +383,7 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
             if not recipient_input.startswith("+"):
                 st.error("Enter the number in international format, e.g. +243800000001")
             else:
-                voice_lang = "en" if lang == "both" else lang
+                voice_lang = "en" if lang == "all" else lang
                 voice_message = (build_zone_alert_message(zone, voice_lang) if zone
                                   else build_alert_message(zone_count, ref_date_str, voice_lang))
                 with st.spinner("Placing call..."):
@@ -414,6 +434,8 @@ def load_climate():
                  pd.to_timedelta(df["DOY"] - 1, unit="D")
     weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
     df[weather_cols] = df[weather_cols].where(df[weather_cols] >= -900)  # -999 -> NaN
+    if "WD2M" in df.columns:  # wind direction — only present for dates fetched after this was added
+        df["WD2M"] = df["WD2M"].where(df["WD2M"] >= -900)
     return df
 
 @st.cache_data
@@ -528,6 +550,214 @@ def fetch_pm25_batch(lat_lon_pairs, chunk_size=30):
                     "us_aqi": current.get("us_aqi"),
                 }
     return results
+
+# -------------------------------------------------------------
+# NASA FIRMS — confirmed active fire detections (satellite, NOT prediction)
+# -------------------------------------------------------------
+# Bounding box covering Haut-Katanga, Lualaba & Tanganyika: west,south,east,north
+FIRMS_BBOX = "24,-13,31,-4"
+FIRMS_SOURCE = "VIIRS_NOAA20_NRT"  # near-real-time VIIRS/NOAA-20 detections
+FIRMS_DAY_RANGE = 2  # last 2 days of detections
+
+
+@st.cache_data(ttl=1800)  # FIRMS refreshes every few hours; 30 min cache is plenty
+def fetch_active_fires():
+    """Fetches CONFIRMED active fire detections from NASA FIRMS (satellite
+    hotspots — actually observed, not predicted) for the Katanga bounding
+    box. Requires a free MAP_KEY (see https://firms.modaps.eosdis.nasa.gov/api/map_key/)
+    in Streamlit secrets as FIRMS_MAP_KEY. Returns an empty DataFrame (not
+    an error) if the key is missing or the request fails, so this never
+    blocks the rest of the dashboard from working."""
+    map_key = st.secrets.get("FIRMS_MAP_KEY")
+    if not map_key:
+        return pd.DataFrame(), "no_key"
+
+    url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/{FIRMS_SOURCE}/{FIRMS_BBOX}/{FIRMS_DAY_RANGE}"
+    try:
+        df = pd.read_csv(url, timeout=15)
+    except Exception:
+        return pd.DataFrame(), "fetch_failed"
+
+    if df.empty or "latitude" not in df.columns:
+        return pd.DataFrame(), "empty"
+    return df, "ok"
+
+
+@st.cache_data(ttl=180)  # short cache — citizen reports should feel near-live
+def fetch_fire_reports():
+    """Fetches recent citizen-submitted fire reports from the API
+    (crowd-sourced via the USSD 'Report a fire' menu). Returns an empty
+    DataFrame (not an error) on any failure, so this never blocks the rest
+    of the dashboard."""
+    try:
+        resp = requests.get(f"{API_BASE_URL}/fire-reports", params={"hours": 72}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return pd.DataFrame(), "fetch_failed"
+    if not data:
+        return pd.DataFrame(), "empty"
+    return pd.DataFrame(data), "ok"
+
+
+def fetch_population_estimate(lat: float, lon: float, buffer_deg: float = 0.25,
+                               year: int = 2020, max_wait_seconds: int = 20):
+    """Estimates the population within a small square area around (lat, lon)
+    using WorldPop's free public stats API (no key needed, up to 1000 calls/
+    day). This is an ASYNC API — it returns a task ID immediately, then we
+    poll for the result. Only called on-demand (a button click on ONE
+    selected zone), never automatically for every zone, since polling can
+    take several seconds. Returns (population_count, None) on success, or
+    (None, error_message) on failure/timeout."""
+    half = buffer_deg / 2
+    polygon = {
+        "type": "Feature", "properties": {},
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [lon - half, lat - half], [lon + half, lat - half],
+                [lon + half, lat + half], [lon - half, lat + half],
+                [lon - half, lat - half],
+            ]],
+        },
+    }
+    try:
+        resp = requests.get(
+            "https://api.worldpop.org/v1/services/stats",
+            params={"dataset": "wpgppop", "year": year, "geojson": json.dumps(polygon)},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        task_id = resp.json().get("taskid")
+        if not task_id:
+            return None, "WorldPop didn't return a task ID."
+
+        for _ in range(max_wait_seconds):
+            time.sleep(1)
+            poll = requests.get(f"https://api.worldpop.org/v1/tasks/{task_id}", timeout=10)
+            poll.raise_for_status()
+            pdata = poll.json()
+            status = pdata.get("status")
+            if status == "finished":
+                total = pdata.get("data", {}).get("total_population")
+                return total, None
+            if status == "failed":
+                return None, "WorldPop couldn't process this area."
+        return None, "Timed out waiting for WorldPop (try again — it's sometimes just slow)."
+    except Exception as e:
+        return None, f"Request failed: {e}"
+
+
+def build_area_report_pdf(zone: dict, shelters_all: pd.DataFrame, fires_df: pd.DataFrame,
+                           pop_estimate=None) -> bytes:
+    """Builds a one-page offline-friendly PDF report for a selected zone —
+    risk level, air quality, nearest shelter details, nearby confirmed
+    fires, and the USSD code — for a field team to take somewhere without
+    internet access. Returns the PDF as bytes, ready for st.download_button."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleBig", parent=styles["Title"], textColor=colors.HexColor("#c0392b"))
+    story = []
+
+    story.append(Paragraph("🔥 PHOENIX — Wildfire Area Report", title_style))
+    story.append(Paragraph(f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')} (local time)",
+                            styles["Normal"]))
+    story.append(Spacer(1, 0.6 * cm))
+
+    risk_color = {"High": colors.HexColor("#c0392b"), "Medium": colors.HexColor("#e67e22"),
+                  "Low": colors.HexColor("#27ae60")}.get(zone.get("risk_level"), colors.grey)
+    risk_style = ParagraphStyle("Risk", parent=styles["Heading2"], textColor=risk_color)
+    story.append(Paragraph(f"Risk Level: {zone.get('risk_level', 'N/A')}", risk_style))
+
+    prob = f"{zone['fire_probability_pct']}%" if zone.get("fire_probability_pct") is not None else "N/A"
+    aqi = (f"{zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level', 'N/A')})"
+           if zone.get("pm2_5") is not None else "No live data")
+
+    info_rows = [
+        ["Location (lat, lon)", f"{zone['lat']:.4f}, {zone['lon']:.4f}"],
+        ["Fire probability", prob],
+        ["Air quality (PM2.5)", aqi],
+    ]
+    if pop_estimate is not None:
+        info_rows.append(["Estimated population nearby (~28×28 km)", f"{pop_estimate:,.0f} people"])
+
+    info_table = Table(info_rows, colWidths=[7 * cm, 9 * cm])
+    info_table.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#555555")),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+    ]))
+    story.append(info_table)
+    story.append(Spacer(1, 0.8 * cm))
+
+    story.append(Paragraph("Nearest Shelter", styles["Heading2"]))
+    if zone.get("shelter_name"):
+        shelter_match = shelters_all[shelters_all["name"] == zone["shelter_name"]]
+        cap_txt = "N/A"
+        if not shelter_match.empty:
+            s = shelter_match.iloc[0]
+            cap_txt = f"{int(s['available'])} / {int(s['capacity'])} spots open"
+        shelter_rows = [
+            ["Name", zone["shelter_name"]],
+            ["Distance (straight-line)", f"{zone['shelter_dist']:.1f} km"],
+            ["Capacity", cap_txt],
+        ]
+        shelter_table = Table(shelter_rows, colWidths=[7 * cm, 9 * cm])
+        shelter_table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+        ]))
+        story.append(shelter_table)
+    else:
+        story.append(Paragraph("No nearby shelter found.", styles["Normal"]))
+    story.append(Spacer(1, 0.8 * cm))
+
+    story.append(Paragraph("Nearby Confirmed Fires (NASA FIRMS, last 2 days)", styles["Heading2"]))
+    if fires_df is not None and not fires_df.empty:
+        nearby = fires_df.copy()
+        nearby["dist_km"] = nearby.apply(
+            lambda f: 111 * ((f["latitude"] - zone["lat"]) ** 2 + (f["longitude"] - zone["lon"]) ** 2) ** 0.5,
+            axis=1,
+        )
+        nearby = nearby[nearby["dist_km"] <= 25].sort_values("dist_km")
+        if not nearby.empty:
+            fire_rows = [["Date/Time (UTC)", "Distance", "Confidence"]]
+            for _, f in nearby.head(10).iterrows():
+                fire_rows.append([f"{f.get('acq_date', '')} {f.get('acq_time', '')}",
+                                   f"{f['dist_km']:.1f} km", str(f.get("confidence", "n/a"))])
+            fire_table = Table(fire_rows, colWidths=[6 * cm, 4 * cm, 6 * cm])
+            fire_table.setStyle(TableStyle([
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f5f5f5")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+            ]))
+            story.append(fire_table)
+        else:
+            story.append(Paragraph("None within 25 km.", styles["Normal"]))
+    else:
+        story.append(Paragraph("No confirmed-fire data available right now.", styles["Normal"]))
+    story.append(Spacer(1, 0.8 * cm))
+
+    story.append(Paragraph("No Internet? No Smartphone?", styles["Heading2"]))
+    story.append(Paragraph(
+        f"Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check current fire risk and the "
+        f"nearest shelter — works on any network, no app or data connection needed, in English, "
+        f"French, or Swahili.", styles["Normal"],
+    ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
 
 # -------------------------------------------------------------
 # PERFORMANCE FIX: cache predictions per date
@@ -682,6 +912,29 @@ with tab1:
     HeatMap(heat_data, radius=18, blur=22, max_zoom=8).add_to(heat_fg)
     heat_fg.add_to(m)
 
+    # ---------------------------------------------------------------
+    # Wind direction arrows — only available for dates fetched after WD2M
+    # was added to update_climate_data.py; older historical dates won't
+    # have this column, so the layer is simply empty (not an error) then.
+    # ---------------------------------------------------------------
+    if "WD2M" in day_data.columns and day_data["WD2M"].notna().any():
+        wind_fg = folium.FeatureGroup(name="🧭 Wind direction", show=False)
+        for _, wrow in day_data.dropna(subset=["WD2M"]).iterrows():
+            # WD2M is the direction wind blows FROM (meteorological convention);
+            # rotate +180° so the arrow visually points where the wind is
+            # blowing TO — i.e. the direction fire would likely spread.
+            heading = (float(wrow["WD2M"]) + 180) % 360
+            arrow_html = (
+                f'<div style="transform: rotate({heading}deg); font-size: 22px; '
+                f'color: #01579b; text-shadow: 0 0 3px white;">➤</div>'
+            )
+            folium.Marker(
+                location=[wrow["LAT"], wrow["LON"]],
+                icon=folium.DivIcon(html=arrow_html, icon_size=(24, 24), icon_anchor=(12, 12)),
+                tooltip=f"Wind from {wrow['WD2M']:.0f}° · likely spread direction shown",
+            ).add_to(wind_fg)
+        wind_fg.add_to(m)
+
     shelter_cluster = MarkerCluster(name="Shelters & Resources").add_to(m)
     shelters_to_draw = shelters.sort_values("capacity", ascending=False).head(max_markers)
 
@@ -728,6 +981,52 @@ with tab1:
             ),
             tooltip=s["name"],
         ).add_to(shelter_cluster)
+
+    # ---------------------------------------------------------------
+    # NASA FIRMS — confirmed active fires (satellite-observed, not predicted)
+    # ---------------------------------------------------------------
+    fires_df, fires_status = fetch_active_fires()
+    if fires_status == "ok" and not fires_df.empty:
+        fires_fg = folium.FeatureGroup(name="🔥 Confirmed fires (NASA FIRMS, live)", show=True)
+        for _, f in fires_df.iterrows():
+            confidence = f.get("confidence", "n/a")
+            folium.Marker(
+                location=[f["latitude"], f["longitude"]],
+                icon=folium.Icon(color="orange", icon="fire", prefix="fa"),
+                tooltip=f"Confirmed fire · {f.get('acq_date', '')} {f.get('acq_time', '')}",
+                popup=folium.Popup(
+                    f"<b>🔥 Confirmed active fire</b><br>"
+                    f"Satellite-detected (NASA FIRMS)<br>"
+                    f"Date: {f.get('acq_date', 'n/a')} {f.get('acq_time', 'n/a')} UTC<br>"
+                    f"Satellite: {f.get('satellite', 'n/a')}<br>"
+                    f"Confidence: {confidence}<br>"
+                    f"Fire radiative power: {f.get('frp', 'n/a')} MW",
+                    max_width=260,
+                ),
+            ).add_to(fires_fg)
+        fires_fg.add_to(m)
+
+    # ---------------------------------------------------------------
+    # Citizen-reported fires (crowd-sourced via USSD "Report a fire")
+    # ---------------------------------------------------------------
+    reports_df, reports_status = fetch_fire_reports()
+    if reports_status == "ok" and not reports_df.empty:
+        reports_fg = folium.FeatureGroup(name="📢 Citizen fire reports (last 72h)", show=True)
+        for _, rep in reports_df.iterrows():
+            folium.Marker(
+                location=[rep["lat"], rep["lon"]],
+                icon=folium.Icon(color="darkred", icon="bullhorn", prefix="fa"),
+                tooltip=f"Citizen report · {rep.get('province', '')}",
+                popup=folium.Popup(
+                    f"<b>📢 Citizen-reported fire</b><br>"
+                    f"Province: {rep.get('province', 'n/a')}<br>"
+                    f"Reported: {rep.get('reported_at_utc', 'n/a')} UTC<br>"
+                    f"<small>Approximate location (province reference point — USSD "
+                    f"callers have no GPS), not a precise pin.</small>",
+                    max_width=260,
+                ),
+            ).add_to(reports_fg)
+        reports_fg.add_to(m)
 
     # Route from the selected zone (if any) to its nearest shelter. Uses the
     # PREVIOUS click's selection from session_state — this run's own click
@@ -803,6 +1102,14 @@ with tab1:
         returned_objects=["last_active_drawing"],
     )
 
+    if fires_status == "no_key":
+        st.caption("🔥 **Confirmed fires (NASA FIRMS)** layer needs a free API key — add `FIRMS_MAP_KEY` "
+                   "to Streamlit secrets (get one at https://firms.modaps.eosdis.nasa.gov/api/map_key/) "
+                   "to see satellite-confirmed fires alongside the predicted risk zones.")
+    elif fires_status == "fetch_failed":
+        st.caption("🔥 Couldn't reach NASA FIRMS just now (network hiccup) — confirmed-fire markers are "
+                   "temporarily unavailable. Predicted risk zones above are unaffected.")
+
     # ---------------------------------------------------------------
     # Zone selection (click a risk zone on the map above)
     # ---------------------------------------------------------------
@@ -872,9 +1179,36 @@ with tab1:
                            "showing straight-line distance only.")
         else:
             st.caption("🏠 No nearby shelter found.")
+
+        st.markdown("**👥 Affected population**")
+        if st.button("Estimate population in this area (WorldPop)", key="tab1_pop_btn"):
+            with st.spinner("Querying WorldPop (can take up to ~20 seconds)..."):
+                pop_count, pop_error = fetch_population_estimate(zone["lat"], zone["lon"])
+            if pop_error:
+                st.warning(f"Couldn't get a population estimate: {pop_error}")
+                st.session_state.tab1_pop_estimate = None
+            else:
+                st.session_state.tab1_pop_estimate = pop_count
+                st.info(f"👥 Approximately **{pop_count:,.0f} people** live within ~28×28 km around this zone "
+                        f"(WorldPop 2020 estimate — the most recent stable, complete dataset available).")
+
+        st.markdown("**📄 Offline report**")
+        pdf_bytes = build_area_report_pdf(
+            zone, shelters_all, fires_df if fires_status == "ok" else pd.DataFrame(),
+            pop_estimate=st.session_state.get("tab1_pop_estimate"),
+        )
+        st.download_button(
+            "📄 Download area report (PDF)", data=pdf_bytes,
+            file_name=f"phoenix_area_report_{zone['lat']:.3f}_{zone['lon']:.3f}.pdf",
+            mime="application/pdf", key="tab1_pdf_download",
+        )
+        st.caption("For field teams heading somewhere without internet access — risk, air quality, "
+                   "nearest shelter, and nearby confirmed fires, all on one printable page.")
+
         if st.button("✕ Clear selection", key="tab1_clear_zone"):
             st.session_state.tab1_selected_zone = None
             st.session_state.tab1_route_info = None
+            st.session_state.tab1_pop_estimate = None
             st.rerun()
     else:
         st.caption("💡 Click a risk zone on the map to select it, see the route to its nearest shelter, "
@@ -919,6 +1253,151 @@ with tab1:
             "(school or place of worship) and closest health facility by straight-line distance. "
             "Distances are approximate (haversine), not driving distance."
         )
+
+    st.markdown("---")
+
+    # ---------------------------------------------------------------
+    # Update shelter availability (for shelter staff)
+    # ---------------------------------------------------------------
+    with st.expander("🏠 Update Shelter Availability (for shelter staff)"):
+        st.caption("If you manage a shelter, update how many spots are currently open so evacuees "
+                   "aren't directed to a shelter that's already full.")
+        shelter_options = shelters_all[shelters_all["is_shelter"]].sort_values("name")
+        shelter_choice = st.selectbox(
+            "Shelter", shelter_options["name"],
+            key="shelter_update_choice",
+        )
+        chosen = shelter_options[shelter_options["name"] == shelter_choice].iloc[0]
+        new_available = st.number_input(
+            "Currently available spots", min_value=0, max_value=int(chosen["capacity"]),
+            value=int(chosen["available"]), key="shelter_update_value",
+        )
+        if st.button("Update availability", key="shelter_update_btn"):
+            try:
+                resp = requests.patch(
+                    f"{API_BASE_URL}/shelters/{chosen['osm_id']}/availability",
+                    json={"available": int(new_available)}, timeout=10,
+                )
+                resp.raise_for_status()
+                st.success(f"✅ Updated {shelter_choice}: {new_available}/{int(chosen['capacity'])} spots available.")
+                st.cache_data.clear()  # so the map/table reflect the change on next load
+            except Exception as e:
+                st.error(f"Failed to update: {e}")
+        st.caption("⚠️ Updates apply to the live server for now — they're overwritten by the next "
+                   "scheduled data refresh unless also saved back to the CSV in the repo.")
+
+    st.markdown("---")
+
+    # ---------------------------------------------------------------
+    # Was the forecast right? — spot-check predictions against confirmed fires
+    # ---------------------------------------------------------------
+    st.subheader("📊 Was the Forecast Right?")
+    st.caption("Compares NASA FIRMS confirmed fire detections (last 2 days) against what PHOENIX "
+               "predicted for the nearest grid cell in the 1-3 days before each fire was observed.")
+
+    if fires_status != "ok" or fires_df.empty:
+        st.info("No confirmed fires in the last 2 days to validate against yet.")
+    else:
+        _grid_points = climate[["LAT", "LON"]].drop_duplicates().reset_index(drop=True)
+        _validation_rows = []
+        for _, _fire in fires_df.iterrows():
+            f_lat, f_lon = _fire["latitude"], _fire["longitude"]
+            try:
+                acq_date = pd.to_datetime(_fire["acq_date"])
+            except Exception:
+                continue
+            _dists = ((_grid_points["LAT"] - f_lat) ** 2 + (_grid_points["LON"] - f_lon) ** 2) ** 0.5
+            g_lat, g_lon = _grid_points.loc[_dists.idxmin(), ["LAT", "LON"]]
+
+            was_flagged, checked_any = False, False
+            for days_before in (1, 2, 3):
+                check_date = acq_date - pd.Timedelta(days=days_before)
+                row = climate[(climate["LAT"] == g_lat) & (climate["LON"] == g_lon)
+                               & (climate["date"] == check_date)]
+                if row.empty or pd.isna(row.iloc[0]["T2M_MAX"]):
+                    continue
+                row = row.iloc[0]
+                checked_any = True
+                pred = predict_fire_risk(
+                    lat=g_lat, lon=g_lon, doy=check_date.dayofyear,
+                    t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
+                    rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+                )
+                if pred["risk_level"] in ("High", "Medium"):
+                    was_flagged = True
+                    break
+
+            _validation_rows.append({
+                "Fire date": _fire.get("acq_date"),
+                "Lat": round(f_lat, 3), "Lon": round(f_lon, 3),
+                "Nearest grid cell": f"{g_lat:.2f}, {g_lon:.2f}",
+                "Flagged High/Medium in prior 1-3 days?": (
+                    "✅ Yes" if was_flagged else ("❓ No prior data" if not checked_any else "❌ No")
+                ),
+            })
+
+        if _validation_rows:
+            val_df = pd.DataFrame(_validation_rows)
+            checked_count = (val_df["Flagged High/Medium in prior 1-3 days?"] != "❓ No prior data").sum()
+            flagged_count = (val_df["Flagged High/Medium in prior 1-3 days?"] == "✅ Yes").sum()
+            if checked_count > 0:
+                st.metric("Prediction hit rate",
+                          f"{flagged_count}/{checked_count} confirmed fires were in a zone flagged "
+                          f"High/Medium risk in the prior 1-3 days")
+            st.dataframe(val_df, use_container_width=True, hide_index=True)
+            st.caption("This is a simple spot-check, not a rigorous accuracy metric — it only covers "
+                       "the last 2 days of confirmed fires, and doesn't account for zones the model "
+                       "correctly flagged where no fire happened to be detected by satellite (true "
+                       "negatives aren't visible here).")
+        else:
+            st.info("Not enough overlapping data yet to validate.")
+
+    st.markdown("---")
+
+    # ---------------------------------------------------------------
+    # Seasonal fire-risk analysis
+    # ---------------------------------------------------------------
+    st.subheader("📈 Seasonal Fire Risk Analysis")
+    st.caption("Typical fire-risk probability by month, based on the historical average weather for "
+               "each month across all years in the dataset (region-wide average location). Useful for "
+               "advance planning ahead of the fire season — no extra data source needed, this reuses "
+               "the climate data already collected.")
+
+    _monthly = climate.copy()
+    _monthly["month"] = _monthly["date"].dt.month
+    _monthly_avg = _monthly.groupby("month")[["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]].mean().dropna()
+
+    if not _monthly_avg.empty:
+        _month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        _region_lat, _region_lon = climate["LAT"].mean(), climate["LON"].mean()
+        _season_rows = []
+        for month, row in _monthly_avg.iterrows():
+            representative_doy = pd.Timestamp(2023, int(month), 15).dayofyear  # any non-leap year, day 15
+            pred = predict_fire_risk(
+                lat=_region_lat, lon=_region_lon, doy=representative_doy,
+                t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"], rh2m=row["RH2M"],
+                ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+            )
+            _season_rows.append({
+                "Month": _month_names[int(month) - 1], "month_num": int(month),
+                "Typical Fire Probability (%)": round(pred["fire_probability"] * 100, 1),
+            })
+        _season_df = pd.DataFrame(_season_rows).sort_values("month_num")
+
+        fig = px.bar(
+            _season_df, x="Month", y="Typical Fire Probability (%)",
+            title="Typical Fire Risk by Month (region-wide average, all years)",
+            color="Typical Fire Probability (%)",
+            color_continuous_scale=["#27ae60", "#f39c12", "#e74c3c"],
+        )
+        fig.update_layout(showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        peak_month = _season_df.loc[_season_df["Typical Fire Probability (%)"].idxmax(), "Month"]
+        st.caption(f"📌 Historically, **{peak_month}** shows the highest typical fire risk in this "
+                   f"region — useful for planning resources ahead of the season.")
+    else:
+        st.info("Not enough historical data yet to compute a seasonal pattern.")
 
 # =================================================================
 # TAB 2: Future Prediction (NEW!)
