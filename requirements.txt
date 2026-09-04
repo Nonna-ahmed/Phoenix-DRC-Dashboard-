@@ -10,3 +10,4 @@ pydantic
 africastalking
 requests
 plotly
+reportlab
