@@ -26,6 +26,11 @@ Current monitoring (historical / latest recorded weather):
     GET  /shelters/nearest
     GET  /alerts?date=YYYY-MM-DD
 
+Crowd-sourced reports & shelter management:
+    POST /fire-reports             citizen-submitted fire sighting
+    GET  /fire-reports?hours=72    recent reports, newest first
+    PATCH /shelters/{osm_id}/availability   update open spots at a shelter
+
 Future forecast (climatology — historical average for the same day-of-year):
     POST /predict-future           single point, future date
     GET  /risk-map-future          full grid, future date
@@ -33,10 +38,11 @@ Future forecast (climatology — historical average for the same day-of-year):
                                     falls back to climatology if no API key
 
 Africa's Talking webhooks:
-    POST /ussd    USSD callback — bilingual EN/FR menu, works from any basic
-                  phone with no internet/app. Reports the FORECAST (not the
-                  latest historical reading) for today, so it always reflects
-                  a prediction rather than old recorded data.
+    POST /ussd    USSD callback — English/French/Swahili menu, works from any
+                  phone with no internet/app. Menu: 1) check the fire risk
+                  FORECAST + nearest shelter, or 2) report a fire you saw
+                  (crowd-sourced, saved via /fire-reports, rate-limited to
+                  1 report per phone number per hour to reduce spam).
     POST /voice   Voice callback — speaks the alert text passed in
                   clientState when the dashboard places a call.
 """
@@ -148,6 +154,57 @@ SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
 SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
 if "available" not in SHELTERS_DF.columns:
     SHELTERS_DF["available"] = SHELTERS_DF["capacity"]
+
+# -----------------------------------------------------------------
+# Citizen fire reports (crowd-sourced via USSD) — stored as a local CSV.
+# NOTE: Railway's filesystem is EPHEMERAL — this file persists across
+# requests on the SAME running instance, but is wiped on every redeploy or
+# restart. Fine for a demo/hackathon; for real production use, swap this
+# for a proper database (e.g. a small Postgres add-on) or a Google Sheet.
+# -----------------------------------------------------------------
+FIRE_REPORTS_CSV = "citizen_fire_reports.csv"
+_FIRE_REPORT_COLUMNS = ["report_id", "province", "lat", "lon", "phone_number", "reported_at_utc"]
+FIRE_REPORT_COOLDOWN_MINUTES = 60  # basic anti-spam: one report per phone number per hour
+
+
+class FireReportCooldownError(Exception):
+    """Raised when the same phone number tries to report again too soon —
+    a simple guard against fake/spam reports flooding the map."""
+    def __init__(self, minutes_remaining: float):
+        self.minutes_remaining = minutes_remaining
+        super().__init__(f"Please wait {minutes_remaining:.0f} more minute(s) before reporting again.")
+
+
+def _load_fire_reports() -> pd.DataFrame:
+    if os.path.exists(FIRE_REPORTS_CSV):
+        return pd.read_csv(FIRE_REPORTS_CSV)
+    return pd.DataFrame(columns=_FIRE_REPORT_COLUMNS)
+
+
+def _save_fire_report(province: str, lat: float, lon: float, phone_number: str) -> int:
+    df = _load_fire_reports()
+
+    # Anti-spam: block a new report from the same phone number within the
+    # cooldown window. Only enforced when we actually have a phone number
+    # (USSD always provides one; direct API calls might not).
+    if phone_number and not df.empty:
+        same_caller = df[df["phone_number"].astype(str) == str(phone_number)]
+        if not same_caller.empty:
+            last_report_time = pd.to_datetime(same_caller["reported_at_utc"]).max()
+            elapsed = pd.Timestamp.utcnow().tz_localize(None) - last_report_time
+            remaining = FIRE_REPORT_COOLDOWN_MINUTES - elapsed.total_seconds() / 60
+            if remaining > 0:
+                raise FireReportCooldownError(remaining)
+
+    report_id = int(df["report_id"].max()) + 1 if not df.empty else 1
+    new_row = pd.DataFrame([{
+        "report_id": report_id, "province": province, "lat": lat, "lon": lon,
+        "phone_number": phone_number,
+        "reported_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(FIRE_REPORTS_CSV, index=False)
+    return report_id
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -274,6 +331,29 @@ class AlertOut(BaseModel):
     nearest_shelter: Optional[str]
     nearest_shelter_distance_km: Optional[float]
     message: str
+
+
+# -----------------------------------------------------------------
+# Request / response schemas — citizen fire reports & shelter updates
+# -----------------------------------------------------------------
+class FireReportRequest(BaseModel):
+    province: str = Field(..., description="Haut-Katanga, Lualaba, or Tanganyika")
+    lat: float = Field(..., json_schema_extra={"example": -11.66})
+    lon: float = Field(..., json_schema_extra={"example": 27.48})
+    phone_number: Optional[str] = Field(None, description="Reporter's phone number, if available")
+
+
+class FireReportOut(BaseModel):
+    report_id: int
+    province: str
+    lat: float
+    lon: float
+    phone_number: Optional[str] = None
+    reported_at_utc: str
+
+
+class ShelterAvailabilityRequest(BaseModel):
+    available: int = Field(..., ge=0, description="Current number of open spots")
 
 
 # -----------------------------------------------------------------
@@ -465,6 +545,60 @@ def alerts(date: date_type = Query(..., description="Date to evaluate, e.g. 2026
 
 
 # ===================================================================
+# Citizen fire reports (crowd-sourced) & shelter availability updates
+# ===================================================================
+@app.post("/fire-reports", response_model=FireReportOut)
+def submit_fire_report(req: FireReportRequest):
+    """Records a citizen-submitted fire sighting (from USSD or the API
+    directly). Helps cover the ~3-5 day gap in NASA POWER's own processing
+    lag with real-time, on-the-ground reports. Rate-limited to one report
+    per phone number per hour to reduce fake/spam reports."""
+    if req.province not in PROVINCE_REF_POINTS:
+        raise HTTPException(status_code=400, detail=f"province must be one of {list(PROVINCE_REF_POINTS)}")
+    try:
+        report_id = _save_fire_report(req.province, req.lat, req.lon, req.phone_number)
+    except FireReportCooldownError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+    return {
+        "report_id": report_id, "province": req.province, "lat": req.lat, "lon": req.lon,
+        "phone_number": req.phone_number,
+        "reported_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/fire-reports", response_model=List[FireReportOut])
+def list_fire_reports(hours: int = Query(72, description="Only reports from the last N hours")):
+    """Lists recent citizen fire reports, newest first. Defaults to the
+    last 72 hours so old reports don't linger on the map forever."""
+    df = _load_fire_reports()
+    if df.empty:
+        return []
+    df["reported_at_utc"] = pd.to_datetime(df["reported_at_utc"])
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=hours)
+    df = df[df["reported_at_utc"] >= cutoff].sort_values("reported_at_utc", ascending=False)
+    df["reported_at_utc"] = df["reported_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return df.to_dict(orient="records")
+
+
+@app.patch("/shelters/{osm_id}/availability")
+def update_shelter_availability(osm_id: str, req: ShelterAvailabilityRequest):
+    """Lets shelter staff update how many spots are currently open. Changes
+    persist for the life of this running instance (see the ephemeral-storage
+    note on FIRE_REPORTS_CSV above — same caveat applies here)."""
+    global SHELTERS_DF
+    match = SHELTERS_DF["osm_id"].astype(str) == str(osm_id)
+    if not match.any():
+        raise HTTPException(status_code=404, detail=f"No shelter with osm_id={osm_id}")
+    SHELTERS_DF.loc[match, "available"] = req.available
+    SHELTERS_DF.to_csv("drc_katanga_shelters_final.csv", index=False)
+    updated = SHELTERS_DF.loc[match].iloc[0]
+    return {
+        "osm_id": osm_id, "name": updated["name"],
+        "available": int(updated["available"]), "capacity": int(updated["capacity"]),
+    }
+
+
+# ===================================================================
 # Future-forecast endpoints (climatology)
 # ===================================================================
 @app.post("/predict-future", response_model=PredictFutureResponse)
@@ -630,10 +764,64 @@ def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
                          if nearest_name else "Aucun abri disponible trouve.")
         return (f"PHOENIX - Prevision Incendie ({date_str})\n"
                 f"Zones a haut risque (prevues): {high_count}\n{shelter_line}\nRestez en securite.")
+    if lang == "sw":
+        shelter_line = (f"Makazi ya karibu: {nearest_name} ({nearest_dist} km)"
+                         if nearest_name else "Hakuna makazi yanayopatikana.")
+        return (f"PHOENIX - Utabiri wa Moto ({date_str})\n"
+                f"Maeneo hatari zaidi (utabiri): {high_count}\n{shelter_line}\nKaa salama.")
     shelter_line = (f"Nearest shelter: {nearest_name} ({nearest_dist} km)"
                      if nearest_name else "No available shelter found.")
     return (f"PHOENIX - Fire Forecast ({date_str})\n"
             f"High-risk zones (forecast): {high_count}\n{shelter_line}\nStay safe.")
+
+
+_USSD_LANG_MAP = {"1": "en", "2": "fr", "3": "sw"}
+
+_USSD_TEXT = {
+    "main_menu": {
+        "en": "CON What would you like to do?\n1. Check fire risk & shelter\n2. Report a fire you saw",
+        "fr": "CON Que voulez-vous faire ?\n1. Verifier le risque et l'abri\n2. Signaler un incendie",
+        "sw": "CON Ungependa kufanya nini?\n1. Angalia hatari ya moto na makazi\n2. Ripoti moto ulioona",
+    },
+    "province_check": {
+        "en": "CON Choose your province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "fr": "CON Choisissez votre province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "sw": "CON Chagua mkoa wako:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    },
+    "province_report": {
+        "en": "CON Which province is the fire in?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "fr": "CON Dans quelle province est l'incendie ?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "sw": "CON Moto uko mkoa gani?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    },
+    "invalid": {
+        "en": "END Invalid choice.", "fr": "END Choix invalide.", "sw": "END Chaguo batili.",
+    },
+    "no_forecast": {
+        "en": "No forecast available right now. Try again later.",
+        "fr": "Aucune prevision disponible. Reessayez plus tard.",
+        "sw": "Hakuna utabiri unaopatikana sasa. Jaribu tena baadaye.",
+    },
+    "report_thanks": {
+        "en": "END Thank you! Your report (#{id}) has been recorded for {province}. Stay safe.",
+        "fr": "END Merci ! Votre signalement (#{id}) a ete enregistre pour {province}. Restez en securite.",
+        "sw": "END Asante! Ripoti yako (#{id}) imesajiliwa kwa {province}. Kaa salama.",
+    },
+    "report_cooldown": {
+        "en": "END You already reported recently — thank you. Please wait a bit before reporting again.",
+        "fr": "END Vous avez deja signale recemment — merci. Veuillez patienter avant de signaler a nouveau.",
+        "sw": "END Tayari umeripoti hivi karibuni — asante. Tafadhali subiri kabla ya kuripoti tena.",
+    },
+    "report_failed": {
+        "en": "END Could not save your report right now. Please try again later.",
+        "fr": "END Impossible d'enregistrer votre signalement. Reessayez plus tard.",
+        "sw": "END Imeshindikana kuhifadhi ripoti yako. Jaribu tena baadaye.",
+    },
+    "session_error": {
+        "en": "END Session error. Please try again.",
+        "fr": "END Erreur de session. Reessayez.",
+        "sw": "END Hitilafu ya kikao. Tafadhali jaribu tena.",
+    },
+}
 
 
 @app.post("/ussd")
@@ -641,40 +829,65 @@ async def ussd(request: Request):
     """Africa's Talking USSD callback. Register a USSD channel in the
     Africa's Talking console pointed at this URL — anyone can then dial the
     assigned code from ANY phone (no smartphone, app, or internet needed) to
-    check the fire risk FORECAST and the nearest shelter, in English or
-    French.
+    check the fire risk FORECAST and nearest shelter, OR report a fire they
+    saw, in English, French, or Swahili.
 
     Protocol: Africa's Talking POSTs form-encoded sessionId / serviceCode /
     phoneNumber / text. `text` accumulates the caller's choices separated by
-    '*' as the session progresses (e.g. '', '1', '1*2'). The response must
-    start with 'CON ' to keep the session open and show another menu, or
-    'END ' to send a final message and hang up."""
+    '*' as the session progresses (e.g. '', '1', '1*2', '1*2*1'). The
+    response must start with 'CON ' to keep the session open and show
+    another menu, or 'END ' to send a final message and hang up."""
     form = await request.form()
     text = form.get("text", "")
+    phone_number = form.get("phoneNumber", "")
     steps = text.split("*") if text else []
 
     if text == "":
-        response = "CON Welcome to PHOENIX Fire Alert\nBienvenue a PHOENIX\n1. English\n2. Francais"
+        response = "CON Welcome to PHOENIX Fire Alert\nBienvenue a PHOENIX\nKaribu PHOENIX\n1. English\n2. Francais\n3. Kiswahili"
+
     elif len(steps) == 1:
-        lang = "en" if steps[0] == "1" else "fr"
-        response = ("CON Choose your province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika"
-                    if lang == "en" else
-                    "CON Choisissez votre province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika")
+        lang = _USSD_LANG_MAP.get(steps[0], "en")
+        response = _USSD_TEXT["main_menu"][lang]
+
     elif len(steps) == 2:
-        lang = "en" if steps[0] == "1" else "fr"
-        province = {"1": "Haut-Katanga", "2": "Lualaba", "3": "Tanganyika"}.get(steps[1])
-        if not province:
-            response = "END Invalid choice. / Choix invalide."
+        lang = _USSD_LANG_MAP.get(steps[0], "en")
+        action = steps[1]
+        if action not in ("1", "2"):
+            response = _USSD_TEXT["invalid"][lang]
+        elif action == "1":
+            response = _USSD_TEXT["province_check"][lang]
         else:
+            response = _USSD_TEXT["province_report"][lang]
+
+    elif len(steps) == 3:
+        lang = _USSD_LANG_MAP.get(steps[0], "en")
+        action = steps[1]
+        province = {"1": "Haut-Katanga", "2": "Lualaba", "3": "Tanganyika"}.get(steps[2])
+        if not province:
+            response = _USSD_TEXT["invalid"][lang]
+        elif action == "1":
             ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
             try:
                 summary = _ussd_forecast_summary(ref_lat, ref_lon, lang)
             except Exception:
-                summary = ("No forecast available right now. Try again later." if lang == "en"
-                           else "Aucune prevision disponible. Reessayez plus tard.")
+                summary = _USSD_TEXT["no_forecast"][lang]
             response = f"END {summary}"
+        else:
+            # Crowd-sourced report — no GPS on USSD, so we log it at the
+            # province's reference point. Good enough for "something is
+            # happening in this province, worth a look" — not a precise pin.
+            ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
+            try:
+                report_id = _save_fire_report(province, ref_lat, ref_lon, phone_number)
+                response = _USSD_TEXT["report_thanks"][lang].format(id=report_id, province=province)
+            except FireReportCooldownError:
+                response = _USSD_TEXT["report_cooldown"][lang]
+            except Exception:
+                response = _USSD_TEXT["report_failed"][lang]
+
     else:
-        response = "END Session error. Please try again. / Erreur de session. Reessayez."
+        lang = _USSD_LANG_MAP.get(steps[0], "en") if steps else "en"
+        response = _USSD_TEXT["session_error"][lang]
 
     return PlainTextResponse(content=response, media_type="text/plain")
 
