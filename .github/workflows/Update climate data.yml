@@ -1,4 +1,4 @@
-name: Update climate data
+name: Update data & send alerts
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
     # runs — that's expected, not a failure of this workflow. Air quality
     # changes faster than climate; if you want it refreshed more often,
     # add a second cron entry here (e.g. "0 */6 * * *" for every 6 hours)
-    # and skip the climate step on those extra runs.
+    # and skip the climate/alert steps on those extra runs.
     - cron: "0 3 * * *"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
@@ -27,7 +27,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas requests
+        run: pip install pandas requests africastalking
 
       - name: Fetch latest NASA POWER climate data
         run: python update_climate_data.py
@@ -47,3 +47,9 @@ jobs:
             git pull --rebase --autostash origin main
             git push
           fi
+
+      - name: Send automatic alerts for High-risk zones
+        env:
+          AT_USERNAME: ${{ secrets.AT_USERNAME }}
+          AT_API_KEY: ${{ secrets.AT_API_KEY }}
+        run: python send_scheduled_alerts.py
