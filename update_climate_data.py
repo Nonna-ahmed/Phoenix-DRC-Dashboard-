@@ -40,7 +40,7 @@ LOOKBACK_DAYS = 10
 # docs and adjust if the numbers look inconsistent with older rows.
 COMMUNITY = "RE"
 
-PARAMETERS = "T2M_MAX,T2M_MIN,RH2M,WS2M,PRECTOTCORR"
+PARAMETERS = "T2M_MAX,T2M_MIN,RH2M,WS2M,WD2M,PRECTOTCORR"
 
 POWER_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 
@@ -85,6 +85,7 @@ def fetch_point(lat: float, lon: float, start: date, end: date) -> pd.DataFrame:
             "T2M_MIN": param_data.get("T2M_MIN", {}).get(d),
             "RH2M": param_data.get("RH2M", {}).get(d),
             "WS2M": param_data.get("WS2M", {}).get(d),
+            "WD2M": param_data.get("WD2M", {}).get(d),
             "PRECTOTCORR": param_data.get("PRECTOTCORR", {}).get(d),
         })
     return pd.DataFrame(rows)
