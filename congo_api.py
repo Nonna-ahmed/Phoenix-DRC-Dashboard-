@@ -48,7 +48,7 @@ Africa's Talking webhooks:
 """
 
 from datetime import date as date_type, timedelta
-from math import radians, sin, cos, sqrt, atan2
+from math import radians, sin, cos, sqrt, atan2, exp, log
 from typing import Optional, List, Dict
 import json
 import os
@@ -154,6 +154,12 @@ SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
 SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
 if "available" not in SHELTERS_DF.columns:
     SHELTERS_DF["available"] = SHELTERS_DF["capacity"]
+# Accessibility info for elderly/disabled evacuees — genuinely unknown
+# until shelter staff report it via PATCH /shelters/{osm_id}/availability,
+# never invented or assumed.
+for _col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
+    if _col not in SHELTERS_DF.columns:
+        SHELTERS_DF[_col] = None
 
 # -----------------------------------------------------------------
 # Citizen fire reports (crowd-sourced via USSD) — stored as a local CSV.
@@ -212,6 +218,44 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
     return R * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+# -----------------------------------------------------------------
+# Evacuation assistance requests — for elderly or disabled people (or
+# their family) who need help evacuating, not just a fire sighting.
+# Same ephemeral-storage caveat as fire reports.
+# -----------------------------------------------------------------
+ASSISTANCE_REQUESTS_CSV = "assistance_requests.csv"
+_ASSISTANCE_COLUMNS = ["request_id", "province", "lat", "lon", "phone_number", "requested_at_utc"]
+ASSISTANCE_COOLDOWN_MINUTES = 10  # short — a genuine urgent need shouldn't be blocked for long
+
+
+def _load_assistance_requests() -> pd.DataFrame:
+    if os.path.exists(ASSISTANCE_REQUESTS_CSV):
+        return pd.read_csv(ASSISTANCE_REQUESTS_CSV)
+    return pd.DataFrame(columns=_ASSISTANCE_COLUMNS)
+
+
+def _save_assistance_request(province: str, lat: float, lon: float, phone_number: str) -> int:
+    df = _load_assistance_requests()
+    if phone_number and not df.empty:
+        same_caller = df[df["phone_number"].astype(str) == str(phone_number)]
+        if not same_caller.empty:
+            last_time = pd.to_datetime(same_caller["requested_at_utc"]).max()
+            elapsed = pd.Timestamp.utcnow().tz_localize(None) - last_time
+            remaining = ASSISTANCE_COOLDOWN_MINUTES - elapsed.total_seconds() / 60
+            if remaining > 0:
+                raise FireReportCooldownError(remaining)  # same cooldown mechanism, reused
+
+    request_id = int(df["request_id"].max()) + 1 if not df.empty else 1
+    new_row = pd.DataFrame([{
+        "request_id": request_id, "province": province, "lat": lat, "lon": lon,
+        "phone_number": phone_number,
+        "requested_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(ASSISTANCE_REQUESTS_CSV, index=False)
+    return request_id
 
 
 # Reference point per province, used by the USSD menu to give a quick
@@ -281,6 +325,147 @@ CLIM_ENGINE = ClimatologyEngine(CLIMATE_DF)
 
 
 # -----------------------------------------------------------------
+# Canadian Fire Weather Index (FWI) System — Van Wagner & Pickett (1985/87)
+# Independent, internationally-used fire-danger standard (used by Canada,
+# and adapted elsewhere), run alongside the ML model as a cross-check.
+# -----------------------------------------------------------------
+# APPROXIMATIONS made for this near-equatorial region (Katanga, DRC):
+#   - The FWI System's day-length factors (Le for DMC, Lf for DC) are
+#     normally looked up per calendar month from a table tuned for Canadian
+#     latitudes, where day length varies a lot across the year. Near the
+#     equator, day length is close to constant (~11.5-12.5h) year-round, so
+#     month-specific factors barely matter — we use fixed near-equatorial
+#     constants instead of Canada's table.
+#   - "Noon temperature" is approximated using the daily T2M_MAX, since
+#     NASA POWER provides daily max/min rather than hourly readings — a
+#     common substitution when only daily data is available.
+#   - Wind speed is converted from NASA POWER's m/s to the km/h the FWI
+#     System's equations expect.
+_FWI_LE_EQUATOR = 9.0   # DMC effective day-length factor, near-equatorial
+_FWI_LF_EQUATOR = 1.4   # DC day-length factor, near-equatorial
+
+_FWI_STARTUP = {"ffmc": 85.0, "dmc": 6.0, "dc": 15.0}  # standard Van Wagner (1987) spring startup values
+
+
+def _fwi_danger_class(fwi_value: float) -> str:
+    """Approximate danger classification — commonly cited FWI bins, not an
+    exact match to any single jurisdiction's calibrated thresholds."""
+    if fwi_value < 5:
+        return "Low"
+    if fwi_value < 10:
+        return "Moderate"
+    if fwi_value < 20:
+        return "High"
+    if fwi_value < 30:
+        return "Very High"
+    return "Extreme"
+
+
+def compute_fwi(lat: float, lon: float):
+    """Runs the full Canadian FWI System recursively over EVERY day of
+    weather on record for the nearest grid cell (each day's fuel moisture
+    codes depend on the previous day's — this is inherent to the FWI
+    System, not something we can skip), and returns the final day's
+    component values. Returns None if there's no usable weather data for
+    that location."""
+    grid_points = CLIMATE_DF[["LAT", "LON"]].drop_duplicates()
+    if grid_points.empty:
+        return None
+    dists = ((grid_points["LAT"] - lat) ** 2 + (grid_points["LON"] - lon) ** 2) ** 0.5
+    g_lat, g_lon = grid_points.loc[dists.idxmin(), ["LAT", "LON"]]
+
+    series = CLIMATE_DF[(CLIMATE_DF["LAT"] == g_lat) & (CLIMATE_DF["LON"] == g_lon)].sort_values("date")
+    series = series.dropna(subset=["T2M_MAX", "RH2M", "WS2M", "PRECTOTCORR"])
+    if series.empty:
+        return None
+
+    ffmc, dmc, dc = _FWI_STARTUP["ffmc"], _FWI_STARTUP["dmc"], _FWI_STARTUP["dc"]
+    last_date, last_wind_kmh = None, 0.0
+
+    for _, row in series.iterrows():
+        T = float(row["T2M_MAX"])
+        RH = min(max(float(row["RH2M"]), 0.0), 100.0)
+        W = float(row["WS2M"]) * 3.6  # m/s -> km/h
+        H = max(float(row["PRECTOTCORR"]), 0.0)
+
+        # --- FFMC (Fine Fuel Moisture Code) ---
+        mo = 147.2 * (101 - ffmc) / (59.5 + ffmc)
+        if H > 0.5:
+            rf = H - 0.5
+            mr = mo + 42.5 * rf * exp(-100 / (251 - mo)) * (1 - exp(-6.93 / rf))
+            if mo > 150:
+                mr += 0.0015 * (mo - 150) ** 2 * sqrt(rf)
+            mo = min(mr, 250)
+        Ed = (0.942 * RH ** 0.679 + 11 * exp((RH - 100) / 10)
+              + 0.18 * (21.1 - T) * (1 - exp(-0.115 * RH)))
+        if mo > Ed:
+            ko = 0.424 * (1 - (RH / 100) ** 1.7) + 0.0694 * sqrt(W) * (1 - (RH / 100) ** 8)
+            kd = ko * 0.581 * exp(0.0365 * T)
+            m = Ed + (mo - Ed) * 10 ** (-kd)
+        else:
+            Ew = (0.618 * RH ** 0.753 + 10 * exp((RH - 100) / 10)
+                  + 0.18 * (21.1 - T) * (1 - exp(-0.115 * RH)))
+            if mo < Ew:
+                k1 = 0.424 * (1 - ((100 - RH) / 100) ** 1.7) + 0.0694 * sqrt(W) * (1 - ((100 - RH) / 100) ** 8)
+                kw = k1 * 0.581 * exp(0.0365 * T)
+                m = Ew - (Ew - mo) * 10 ** (-kw)
+            else:
+                m = mo
+        ffmc = min(max(59.5 * (250 - m) / (147.2 + m), 0.0), 101.0)
+
+        # --- DMC (Duff Moisture Code) ---
+        Tc = max(T, -1.1)
+        if H > 1.5:
+            re = 0.92 * H - 1.27
+            mo_dmc = 20 + exp(5.6348 - dmc / 43.43)
+            if dmc <= 33:
+                b = 100 / (0.5 + 0.3 * dmc)
+            elif dmc <= 65:
+                b = 14 - 1.3 * log(dmc)
+            else:
+                b = 6.2 * log(dmc) - 17.2
+            mr_dmc = mo_dmc + 1000 * re / (48.77 + b * re)
+            dmc = max(244.72 - 43.43 * log(mr_dmc - 20), 0.0)
+        k = 1.894 * (Tc + 1.1) * (100 - RH) * _FWI_LE_EQUATOR * 1e-6
+        dmc = dmc + 100 * k
+
+        # --- DC (Drought Code) ---
+        Tc2 = max(T, -2.8)
+        if H > 2.8:
+            rd = 0.83 * H - 1.27
+            Qo = 800 * exp(-dc / 400)
+            Qr = Qo + 3.937 * rd
+            dc = max(400 * log(800 / Qr), 0.0)
+        V = max(0.36 * (Tc2 + 2.8) + _FWI_LF_EQUATOR, 0.0)
+        dc = dc + 0.5 * V
+
+        last_date, last_wind_kmh = row["date"], W
+
+    # --- ISI, BUI, FWI (final day only) ---
+    m_final = 147.2 * (101 - ffmc) / (59.5 + ffmc)
+    fF = 91.9 * exp(-0.1386 * m_final) * (1 + m_final ** 5.31 / 4.93e7)
+    fW = exp(0.05039 * last_wind_kmh)
+    isi = 0.208 * fW * fF
+
+    denom = dmc + 0.4 * dc
+    bui = 0.8 * dmc * dc / denom if denom > 0 and dmc <= 0.4 * dc else (
+        dmc - (1 - 0.8 * dc / denom) * (0.92 + (0.0114 * dmc) ** 1.7) if denom > 0 else 0.0
+    )
+    bui = max(bui, 0.0)
+
+    fD = 0.626 * bui ** 0.809 + 2 if bui <= 80 else 1000 / (25 + 108.64 * exp(-0.023 * bui))
+    B = 0.1 * isi * fD
+    fwi_value = exp(2.72 * (0.434 * log(B)) ** 0.647) if B > 1 else B
+
+    return {
+        "lat": float(g_lat), "lon": float(g_lon), "as_of_date": str(last_date.date()),
+        "ffmc": round(ffmc, 1), "dmc": round(dmc, 1), "dc": round(dc, 1),
+        "isi": round(isi, 1), "bui": round(bui, 1), "fwi": round(fwi_value, 1),
+        "danger_class": _fwi_danger_class(fwi_value),
+    }
+
+
+# -----------------------------------------------------------------
 # Request / response schemas — current monitoring
 # -----------------------------------------------------------------
 class PredictRequest(BaseModel):
@@ -312,6 +497,12 @@ class ShelterOut(BaseModel):
     pm2_5: Optional[float] = None
     us_aqi: Optional[float] = None
     observation_time: Optional[str] = None
+    # Accessibility info — only set once shelter staff enter it via
+    # PATCH /shelters/{osm_id}/availability; None means "not yet known",
+    # never assumed or invented.
+    wheelchair_accessible: Optional[bool] = None
+    ground_floor: Optional[bool] = None
+    medical_staff_onsite: Optional[bool] = None
 
 
 class NearestShelterResponse(BaseModel):
@@ -352,8 +543,27 @@ class FireReportOut(BaseModel):
     reported_at_utc: str
 
 
+class AssistanceRequestIn(BaseModel):
+    province: str = Field(..., description="Haut-Katanga, Lualaba, or Tanganyika")
+    lat: float = Field(..., json_schema_extra={"example": -11.66})
+    lon: float = Field(..., json_schema_extra={"example": 27.48})
+    phone_number: Optional[str] = Field(None, description="Requester's phone number, if available")
+
+
+class AssistanceRequestOut(BaseModel):
+    request_id: int
+    province: str
+    lat: float
+    lon: float
+    phone_number: Optional[str] = None
+    requested_at_utc: str
+
+
 class ShelterAvailabilityRequest(BaseModel):
     available: int = Field(..., ge=0, description="Current number of open spots")
+    wheelchair_accessible: Optional[bool] = Field(None, description="Set only if you know for certain")
+    ground_floor: Optional[bool] = Field(None, description="Set only if you know for certain")
+    medical_staff_onsite: Optional[bool] = Field(None, description="Set only if you know for certain")
 
 
 # -----------------------------------------------------------------
@@ -487,8 +697,9 @@ def list_shelters(
     if only_shelters:
         df = df[df["is_shelter"]]
     cols = ["osm_id", "category", "name", "lat", "lon", "capacity", "available", "is_shelter",
-            "province", "pm2_5", "us_aqi", "observation_time"]
-    return df[cols].to_dict(orient="records")
+            "province", "pm2_5", "us_aqi", "observation_time",
+            "wheelchair_accessible", "ground_floor", "medical_staff_onsite"]
+    return df[cols].where(pd.notna(df[cols]), None).to_dict(orient="records")
 
 
 @app.get("/shelters/nearest", response_model=NearestShelterResponse)
@@ -580,21 +791,138 @@ def list_fire_reports(hours: int = Query(72, description="Only reports from the 
     return df.to_dict(orient="records")
 
 
+@app.post("/assistance-requests", response_model=AssistanceRequestOut)
+def submit_assistance_request(req: AssistanceRequestIn):
+    """Records a request for evacuation assistance — for elderly or
+    disabled people (or someone calling on their behalf) who need help
+    physically evacuating, not just a fire sighting. Surfaced separately
+    from fire reports so responders can prioritize accordingly."""
+    if req.province not in PROVINCE_REF_POINTS:
+        raise HTTPException(status_code=400, detail=f"province must be one of {list(PROVINCE_REF_POINTS)}")
+    try:
+        request_id = _save_assistance_request(req.province, req.lat, req.lon, req.phone_number)
+    except FireReportCooldownError as e:
+        raise HTTPException(status_code=429, detail=str(e))
+    return {
+        "request_id": request_id, "province": req.province, "lat": req.lat, "lon": req.lon,
+        "phone_number": req.phone_number,
+        "requested_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@app.get("/assistance-requests", response_model=List[AssistanceRequestOut])
+def list_assistance_requests(hours: int = Query(72, description="Only requests from the last N hours")):
+    """Lists recent evacuation-assistance requests, newest first."""
+    df = _load_assistance_requests()
+    if df.empty:
+        return []
+    df["requested_at_utc"] = pd.to_datetime(df["requested_at_utc"])
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=hours)
+    df = df[df["requested_at_utc"] >= cutoff].sort_values("requested_at_utc", ascending=False)
+    df["requested_at_utc"] = df["requested_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return df.to_dict(orient="records")
+
+
 @app.patch("/shelters/{osm_id}/availability")
 def update_shelter_availability(osm_id: str, req: ShelterAvailabilityRequest):
-    """Lets shelter staff update how many spots are currently open. Changes
-    persist for the life of this running instance (see the ephemeral-storage
-    note on FIRE_REPORTS_CSV above — same caveat applies here)."""
+    """Lets shelter staff update how many spots are currently open, and
+    optionally report accessibility info (wheelchair access, ground floor,
+    medical staff on-site) for elderly/disabled evacuees — only set fields
+    the caller actually knows; anything left out stays as it was (never
+    reset to "no" by omission). Changes persist for the life of this
+    running instance (see the ephemeral-storage note on FIRE_REPORTS_CSV
+    above — same caveat applies here)."""
     global SHELTERS_DF
     match = SHELTERS_DF["osm_id"].astype(str) == str(osm_id)
     if not match.any():
         raise HTTPException(status_code=404, detail=f"No shelter with osm_id={osm_id}")
     SHELTERS_DF.loc[match, "available"] = req.available
+    for field in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
+        value = getattr(req, field)
+        if value is not None:
+            SHELTERS_DF.loc[match, field] = value
     SHELTERS_DF.to_csv("drc_katanga_shelters_final.csv", index=False)
     updated = SHELTERS_DF.loc[match].iloc[0]
     return {
         "osm_id": osm_id, "name": updated["name"],
         "available": int(updated["available"]), "capacity": int(updated["capacity"]),
+        "wheelchair_accessible": (None if pd.isna(updated["wheelchair_accessible"])
+                                   else bool(updated["wheelchair_accessible"])),
+        "ground_floor": None if pd.isna(updated["ground_floor"]) else bool(updated["ground_floor"]),
+        "medical_staff_onsite": (None if pd.isna(updated["medical_staff_onsite"])
+                                  else bool(updated["medical_staff_onsite"])),
+    }
+
+
+@app.get("/fwi")
+def get_fwi(
+    lat: float = Query(..., json_schema_extra={"example": -11.66}),
+    lon: float = Query(..., json_schema_extra={"example": 27.48}),
+):
+    """Computes the real Canadian Fire Weather Index (FFMC/DMC/DC/ISI/BUI/
+    FWI) for the nearest grid cell — an independent, internationally-used
+    fire-danger standard, run alongside (not replacing) the ML model, as a
+    cross-check. See compute_fwi()'s docstring for the approximations made
+    for this near-equatorial region."""
+    result = compute_fwi(lat, lon)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No weather data available for this location.")
+    return result
+
+
+# -----------------------------------------------------------------
+# Dashboard visit tracking & admin stats — same ephemeral-storage caveat
+# as fire reports and shelter updates (resets on redeploy).
+# -----------------------------------------------------------------
+VISITS_LOG_CSV = "dashboard_visits.csv"
+
+
+@app.post("/track-visit")
+def track_visit():
+    """Increments a simple visit counter. The dashboard calls this once per
+    browser session (not per interaction), giving the admin view a rough
+    usage signal."""
+    df = pd.read_csv(VISITS_LOG_CSV) if os.path.exists(VISITS_LOG_CSV) else pd.DataFrame(columns=["timestamp_utc"])
+    new_row = pd.DataFrame([{"timestamp_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")}])
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(VISITS_LOG_CSV, index=False)
+    return {"status": "ok", "total_visits": len(df)}
+
+
+@app.get("/stats")
+def get_stats():
+    """Aggregate usage/activity numbers for the admin dashboard: visits,
+    citizen fire reports, evacuation-assistance requests, and shelter
+    capacity — all real, measured figures (not simulated), though visit
+    tracking only covers time since the last redeploy (ephemeral storage)."""
+    visits_df = pd.read_csv(VISITS_LOG_CSV) if os.path.exists(VISITS_LOG_CSV) else pd.DataFrame()
+    reports_df = _load_fire_reports()
+    assistance_df = _load_assistance_requests()
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=7)
+
+    visits_last_7d = 0
+    if not visits_df.empty:
+        visits_df["timestamp_utc"] = pd.to_datetime(visits_df["timestamp_utc"])
+        visits_last_7d = int((visits_df["timestamp_utc"] >= cutoff).sum())
+
+    reports_last_7d = 0
+    if not reports_df.empty:
+        reports_df["reported_at_utc"] = pd.to_datetime(reports_df["reported_at_utc"])
+        reports_last_7d = int((reports_df["reported_at_utc"] >= cutoff).sum())
+
+    assistance_last_7d = 0
+    if not assistance_df.empty:
+        assistance_df["requested_at_utc"] = pd.to_datetime(assistance_df["requested_at_utc"])
+        assistance_last_7d = int((assistance_df["requested_at_utc"] >= cutoff).sum())
+
+    return {
+        "total_visits": len(visits_df), "visits_last_7_days": visits_last_7d,
+        "total_fire_reports": len(reports_df), "fire_reports_last_7_days": reports_last_7d,
+        "total_assistance_requests": len(assistance_df),
+        "assistance_requests_last_7_days": assistance_last_7d,
+        "total_shelters": int(len(SHELTERS_DF)),
+        "total_shelter_capacity": int(SHELTERS_DF["capacity"].sum()),
+        "total_shelter_available": int(SHELTERS_DF["available"].sum()),
     }
 
 
@@ -779,9 +1107,12 @@ _USSD_LANG_MAP = {"1": "en", "2": "fr", "3": "sw"}
 
 _USSD_TEXT = {
     "main_menu": {
-        "en": "CON What would you like to do?\n1. Check fire risk & shelter\n2. Report a fire you saw",
-        "fr": "CON Que voulez-vous faire ?\n1. Verifier le risque et l'abri\n2. Signaler un incendie",
-        "sw": "CON Ungependa kufanya nini?\n1. Angalia hatari ya moto na makazi\n2. Ripoti moto ulioona",
+        "en": "CON What would you like to do?\n1. Check fire risk & shelter\n2. Report a fire you saw\n"
+              "3. Request evacuation help (elderly/disabled)",
+        "fr": "CON Que voulez-vous faire ?\n1. Verifier le risque et l'abri\n2. Signaler un incendie\n"
+              "3. Demander de l'aide pour evacuer (personnes agees/handicapees)",
+        "sw": "CON Ungependa kufanya nini?\n1. Angalia hatari ya moto na makazi\n2. Ripoti moto ulioona\n"
+              "3. Omba msaada wa uhamishaji (wazee/walemavu)",
     },
     "province_check": {
         "en": "CON Choose your province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
@@ -792,6 +1123,11 @@ _USSD_TEXT = {
         "en": "CON Which province is the fire in?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
         "fr": "CON Dans quelle province est l'incendie ?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
         "sw": "CON Moto uko mkoa gani?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    },
+    "province_assistance": {
+        "en": "CON Which province do you need help in?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "fr": "CON Dans quelle province avez-vous besoin d'aide ?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+        "sw": "CON Unahitaji msaada mkoa gani?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
     },
     "invalid": {
         "en": "END Invalid choice.", "fr": "END Choix invalide.", "sw": "END Chaguo batili.",
@@ -815,6 +1151,29 @@ _USSD_TEXT = {
         "en": "END Could not save your report right now. Please try again later.",
         "fr": "END Impossible d'enregistrer votre signalement. Reessayez plus tard.",
         "sw": "END Imeshindikana kuhifadhi ripoti yako. Jaribu tena baadaye.",
+    },
+    "assistance_thanks": {
+        "en": "END Help request (#{id}) recorded for {province}. A responder will try to reach you. Stay safe.",
+        "fr": "END Demande d'aide (#{id}) enregistree pour {province}. Un intervenant essaiera de vous "
+              "joindre. Restez en securite.",
+        "sw": "END Ombi la msaada (#{id}) limesajiliwa kwa {province}. Mwokozi atajaribu kuwafikia. "
+              "Kaa salama.",
+    },
+    "assistance_cooldown": {
+        "en": "END A help request was already sent recently — it's been recorded. Please wait a few "
+              "minutes before requesting again.",
+        "fr": "END Une demande d'aide a deja ete envoyee recemment — elle a ete enregistree. Veuillez "
+              "patienter quelques minutes avant de redemander.",
+        "sw": "END Ombi la msaada tayari limetumwa hivi karibuni — limesajiliwa. Tafadhali subiri "
+              "dakika chache kabla ya kuomba tena.",
+    },
+    "assistance_failed": {
+        "en": "END Could not save your help request right now. Please try again, or ask someone nearby "
+              "for help.",
+        "fr": "END Impossible d'enregistrer votre demande d'aide. Reessayez, ou demandez de l'aide a "
+              "quelqu'un a proximite.",
+        "sw": "END Imeshindikana kuhifadhi ombi lako la msaada. Jaribu tena, au omba msaada kwa mtu "
+              "aliye karibu.",
     },
     "session_error": {
         "en": "END Session error. Please try again.",
@@ -852,12 +1211,14 @@ async def ussd(request: Request):
     elif len(steps) == 2:
         lang = _USSD_LANG_MAP.get(steps[0], "en")
         action = steps[1]
-        if action not in ("1", "2"):
+        if action not in ("1", "2", "3"):
             response = _USSD_TEXT["invalid"][lang]
         elif action == "1":
             response = _USSD_TEXT["province_check"][lang]
-        else:
+        elif action == "2":
             response = _USSD_TEXT["province_report"][lang]
+        else:
+            response = _USSD_TEXT["province_assistance"][lang]
 
     elif len(steps) == 3:
         lang = _USSD_LANG_MAP.get(steps[0], "en")
@@ -872,7 +1233,7 @@ async def ussd(request: Request):
             except Exception:
                 summary = _USSD_TEXT["no_forecast"][lang]
             response = f"END {summary}"
-        else:
+        elif action == "2":
             # Crowd-sourced report — no GPS on USSD, so we log it at the
             # province's reference point. Good enough for "something is
             # happening in this province, worth a look" — not a precise pin.
@@ -884,6 +1245,17 @@ async def ussd(request: Request):
                 response = _USSD_TEXT["report_cooldown"][lang]
             except Exception:
                 response = _USSD_TEXT["report_failed"][lang]
+        else:
+            # Evacuation assistance request — same province-level location
+            # limitation as fire reports (no GPS on USSD).
+            ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
+            try:
+                request_id = _save_assistance_request(province, ref_lat, ref_lon, phone_number)
+                response = _USSD_TEXT["assistance_thanks"][lang].format(id=request_id, province=province)
+            except FireReportCooldownError:
+                response = _USSD_TEXT["assistance_cooldown"][lang]
+            except Exception:
+                response = _USSD_TEXT["assistance_failed"][lang]
 
     else:
         lang = _USSD_LANG_MAP.get(steps[0], "en") if steps else "en"
