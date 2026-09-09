@@ -11,3 +11,4 @@ africastalking
 requests
 plotly
 reportlab
+gTTS
