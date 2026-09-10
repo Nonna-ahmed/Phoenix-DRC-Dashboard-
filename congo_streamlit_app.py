@@ -64,6 +64,15 @@ FUTURE_COLOR_MAP = {"High": "#e74c3c", "Moderate": "#f39c12", "Low": "#27ae60"}
 # Nearest-facility helper (vectorized haversine — fast even for
 # many risk zones x many shelters/hospitals)
 # -------------------------------------------------------------
+def _acc_icon(value, yes_emoji: str) -> str:
+    """One-character accessibility indicator: the emoji if explicitly True,
+    '✗' if explicitly False (staff reported 'no' — different from unknown!),
+    or '❓' if never reported. Never guesses when it's genuinely unknown."""
+    if pd.isna(value):
+        return "❓"
+    return yes_emoji if value else "✗"
+
+
 def nearest_facility(zone_lats, zone_lons, cand_df):
     """For each (zone_lat, zone_lon), find the nearest row in cand_df
     (which must have 'lat'/'lon' columns). Returns a DataFrame with the
@@ -100,15 +109,25 @@ def nearest_facility(zone_lats, zone_lons, cand_df):
     return matched
 
 
+WALKING_SPEED_KMH = 4.5  # realistic evacuation walking pace (mixed ages/loads), not a brisk-adult 5-6 km/h
+
+
 def fetch_route(start_lat, start_lon, end_lat, end_lon, profile="foot"):
     """Fetches a real road/path route between two points via OSRM's free
-    public demo server (no API key needed). profile: 'foot' (walking) or
-    'driving'. Returns (route_latlon_list, distance_km, duration_min), or
-    (None, None, None) on any failure — the public OSRM demo server is
-    best-effort/rate-limited, not guaranteed for heavy production use, so
-    callers should fall back to the straight-line distance already shown
-    elsewhere if this fails rather than blocking on it."""
-    url = (f"https://router.project-osrm.org/route/v1/{profile}/"
+    public demo server (no API key needed). Returns (route_latlon_list,
+    distance_km, duration_min), or (None, None, None) on any failure — the
+    public OSRM demo server is best-effort/rate-limited, not guaranteed for
+    heavy production use, so callers should fall back to the straight-line
+    distance already shown elsewhere if this fails rather than blocking on it.
+
+    IMPORTANT: the free public OSRM demo only has a DRIVING road graph
+    loaded — requesting '/foot/...' is accepted but silently returns the
+    same car-speed timing (confirmed by testing: identical minutes for both
+    profiles). So we always query the 'driving' profile for the actual road
+    path (same physical roads either way in this context), then compute
+    walking duration ourselves from distance × WALKING_SPEED_KMH instead of
+    trusting OSRM's mismatched number for 'foot'."""
+    url = (f"https://router.project-osrm.org/route/v1/driving/"
            f"{start_lon},{start_lat};{end_lon},{end_lat}"
            f"?overview=full&geometries=geojson")
     try:
@@ -120,7 +139,12 @@ def fetch_route(start_lat, start_lon, end_lat, end_lon, profile="foot"):
         route = data["routes"][0]
         coords = route["geometry"]["coordinates"]  # [[lon, lat], ...]
         latlon = [[c[1], c[0]] for c in coords]
-        return latlon, route["distance"] / 1000, route["duration"] / 60
+        distance_km = route["distance"] / 1000
+        if profile == "foot":
+            duration_min = (distance_km / WALKING_SPEED_KMH) * 60  # our own estimate, not OSRM's
+        else:
+            duration_min = route["duration"] / 60  # OSRM's real driving-time estimate
+        return latlon, distance_km, duration_min
     except Exception:
         return None, None, None
 
@@ -407,10 +431,13 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
         <div style="border:1px solid #90caf9;background:#e3f2fd;border-radius:10px;padding:12px;margin-top:10px;">
             <b>📟 No smartphone? No internet? No problem.</b><br>
             <span style="font-size:14px;">
-            Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check the current fire risk and
-            nearest shelter — works on any network, no app or data connection needed, in English or French.<br>
+            Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check the current fire risk,
+            find the nearest shelter, report a fire, or <b>request evacuation help for an elderly or
+            disabled person</b> — works on any network, no app or data connection needed, in English,
+            French, or Swahili.<br>
             <i>Composez {USSD_SERVICE_CODE} depuis n'importe quel téléphone pour vérifier le risque
-            d'incendie et l'abri le plus proche — fonctionne sans internet ni application.</i>
+            d'incendie, trouver un abri, signaler un incendie, ou demander de l'aide pour une évacuation
+            (personnes âgées ou handicapées) — sans internet ni application.</i>
             </span>
         </div>
         """,
@@ -446,8 +473,15 @@ def load_shelters():
     df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").fillna(25).astype(int)
     if "available" not in df.columns:
         df["available"] = df["capacity"]
+    # Accessibility info for elderly/disabled evacuees — genuinely unknown
+    # until shelter staff report it via the update form below; never
+    # invented or assumed.
+    for col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
+        if col not in df.columns:
+            df[col] = None
     return df[["osm_id", "category", "name", "lat", "lon", "capacity", "available",
-               "is_shelter", "province", "pm2_5", "us_aqi", "observation_time"]]
+               "is_shelter", "province", "pm2_5", "us_aqi", "observation_time",
+               "wheelchair_accessible", "ground_floor", "medical_staff_onsite"]]
 
 climate = load_climate()
 
@@ -500,6 +534,24 @@ st.sidebar.caption("Lower this if the map feels slow to load. Largest-capacity l
 # Sidebar controls
 # -------------------------------------------------------------
 st.sidebar.header("Controls")
+
+# Accessibility: larger text / higher contrast for elderly or low-vision
+# users viewing the dashboard itself (family members, responders, etc.)
+large_text_mode = st.sidebar.checkbox("🔠 Larger text / high contrast", key="large_text_mode")
+if large_text_mode:
+    st.markdown("""
+        <style>
+        html, body, [class*="css"] { font-size: 20px !important; }
+        h1 { font-size: 2.4em !important; }
+        h2 { font-size: 2em !important; }
+        h3 { font-size: 1.6em !important; }
+        .stMetric label, .stMetric [data-testid="stMetricValue"] { font-size: 1.4em !important; }
+        p, span, div, label, li { font-size: 1.15em !important; line-height: 1.6 !important; }
+        .stButton button { font-size: 1.2em !important; padding: 0.6em 1.2em !important; }
+        body { background-color: #ffffff !important; color: #000000 !important; }
+        </style>
+    """, unsafe_allow_html=True)
+
 available_dates = sorted(climate["date"].unique())
 
 selected_date = st.sidebar.select_slider(
@@ -584,13 +636,29 @@ def fetch_active_fires():
 
 
 @st.cache_data(ttl=180)  # short cache — citizen reports should feel near-live
-def fetch_fire_reports():
+def fetch_fire_reports(hours: int = 72):
     """Fetches recent citizen-submitted fire reports from the API
     (crowd-sourced via the USSD 'Report a fire' menu). Returns an empty
     DataFrame (not an error) on any failure, so this never blocks the rest
-    of the dashboard."""
+    of the dashboard. Default 72h for the map overlay; the Admin tab passes
+    a much larger window to see the full history."""
     try:
-        resp = requests.get(f"{API_BASE_URL}/fire-reports", params={"hours": 72}, timeout=10)
+        resp = requests.get(f"{API_BASE_URL}/fire-reports", params={"hours": hours}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return pd.DataFrame(), "fetch_failed"
+    if not data:
+        return pd.DataFrame(), "empty"
+    return pd.DataFrame(data), "ok"
+
+
+@st.cache_data(ttl=180)
+def fetch_assistance_requests(hours: int = 72):
+    """Fetches recent evacuation-assistance requests (elderly/disabled
+    evacuees needing help) from the API. Same shape as fetch_fire_reports."""
+    try:
+        resp = requests.get(f"{API_BASE_URL}/assistance-requests", params={"hours": hours}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -622,19 +690,29 @@ def fetch_population_estimate(lat: float, lon: float, buffer_deg: float = 0.25,
         },
     }
     try:
-        resp = requests.get(
-            "https://api.worldpop.org/v1/services/stats",
-            params={"dataset": "wpgppop", "year": year, "geojson": json.dumps(polygon)},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        task_id = resp.json().get("taskid")
+        task_id = None
+        last_error = None
+        for attempt in range(2):  # WorldPop's server can be slow to accept the initial request
+            try:
+                resp = requests.get(
+                    "https://api.worldpop.org/v1/services/stats",
+                    params={"dataset": "wpgppop", "year": year, "geojson": json.dumps(polygon)},
+                    timeout=25,
+                )
+                resp.raise_for_status()
+                task_id = resp.json().get("taskid")
+                break
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                continue  # try once more before giving up
         if not task_id:
+            if last_error:
+                return None, "WorldPop's server is slow to respond right now — try again in a moment."
             return None, "WorldPop didn't return a task ID."
 
         for _ in range(max_wait_seconds):
             time.sleep(1)
-            poll = requests.get(f"https://api.worldpop.org/v1/tasks/{task_id}", timeout=10)
+            poll = requests.get(f"https://api.worldpop.org/v1/tasks/{task_id}", timeout=15)
             poll.raise_for_status()
             pdata = poll.json()
             status = pdata.get("status")
@@ -702,13 +780,24 @@ def build_area_report_pdf(zone: dict, shelters_all: pd.DataFrame, fires_df: pd.D
     if zone.get("shelter_name"):
         shelter_match = shelters_all[shelters_all["name"] == zone["shelter_name"]]
         cap_txt = "N/A"
+        acc_txt = "Not yet reported"
         if not shelter_match.empty:
             s = shelter_match.iloc[0]
             cap_txt = f"{int(s['available'])} / {int(s['capacity'])} spots open"
+
+            def _acc_label(v):
+                if pd.isna(v):
+                    return "unknown"
+                return "yes" if v else "no"
+
+            acc_txt = (f"Wheelchair: {_acc_label(s.get('wheelchair_accessible'))} · "
+                       f"Ground floor: {_acc_label(s.get('ground_floor'))} · "
+                       f"Medical staff: {_acc_label(s.get('medical_staff_onsite'))}")
         shelter_rows = [
             ["Name", zone["shelter_name"]],
             ["Distance (straight-line)", f"{zone['shelter_dist']:.1f} km"],
             ["Capacity", cap_txt],
+            ["Accessibility", acc_txt],
         ]
         shelter_table = Table(shelter_rows, colWidths=[7 * cm, 9 * cm])
         shelter_table.setStyle(TableStyle([
@@ -798,9 +887,19 @@ def compute_results_for_date(day_data_records, doy, is_latest):
     return pd.DataFrame(results), success_count, skipped_missing
 
 # -------------------------------------------------------------
+# Track this visit once per session (feeds the Admin tab's usage stats)
+# -------------------------------------------------------------
+if "visit_tracked" not in st.session_state:
+    try:
+        requests.post(f"{API_BASE_URL}/track-visit", timeout=5)
+    except Exception:
+        pass  # never block the dashboard over a tracking call
+    st.session_state.visit_tracked = True
+
+# -------------------------------------------------------------
 # Tabs
 # -------------------------------------------------------------
-tab1, tab2 = st.tabs(["📊 Current Monitoring", "🔮 Future Prediction"])
+tab1, tab2, tab3 = st.tabs(["📊 Current Monitoring", "🔮 Future Prediction", "🔐 Admin"])
 
 # =================================================================
 # TAB 1: Current Monitoring (Original Optimized Dashboard)
@@ -1028,6 +1127,29 @@ with tab1:
             ).add_to(reports_fg)
         reports_fg.add_to(m)
 
+    # ---------------------------------------------------------------
+    # Evacuation assistance requests (elderly/disabled needing help)
+    # ---------------------------------------------------------------
+    assist_df, assist_status = fetch_assistance_requests()
+    if assist_status == "ok" and not assist_df.empty:
+        assist_fg = folium.FeatureGroup(name="♿ Evacuation assistance needed (last 72h)", show=True)
+        for _, req in assist_df.iterrows():
+            folium.Marker(
+                location=[req["lat"], req["lon"]],
+                icon=folium.Icon(color="purple", icon="wheelchair", prefix="fa"),
+                tooltip=f"Assistance needed · {req.get('province', '')}",
+                popup=folium.Popup(
+                    f"<b>♿ Evacuation assistance requested</b><br>"
+                    f"Province: {req.get('province', 'n/a')}<br>"
+                    f"Requested: {req.get('requested_at_utc', 'n/a')} UTC<br>"
+                    f"Contact: {req.get('phone_number', 'n/a')}<br>"
+                    f"<small>Approximate location (province reference point — USSD "
+                    f"callers have no GPS), not a precise pin.</small>",
+                    max_width=260,
+                ),
+            ).add_to(assist_fg)
+        assist_fg.add_to(m)
+
     # Route from the selected zone (if any) to its nearest shelter. Uses the
     # PREVIOUS click's selection from session_state — this run's own click
     # (if any) is only known after st_folium returns further below, so the
@@ -1172,17 +1294,40 @@ with tab1:
             route_info = st.session_state.get("tab1_route_info")
             if route_info:
                 mode_txt = "walking" if route_info["mode"] == "foot" else "driving"
+                est_note = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
+                    if route_info["mode"] == "foot" else ""
                 st.success(f"🛣️ Road route: **{route_info['distance_km']:.1f} km**, "
-                           f"~**{route_info['duration_min']:.0f} min** ({mode_txt}) — shown on the map above.")
+                           f"~**{route_info['duration_min']:.0f} min** ({mode_txt}){est_note} — shown on the map above.")
             else:
                 st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
                            "showing straight-line distance only.")
         else:
             st.caption("🏠 No nearby shelter found.")
 
+        st.markdown("**🔬 Cross-check: Canadian Fire Weather Index**")
+        if st.button("Calculate real FWI (independent standard)", key="tab1_fwi_btn"):
+            with st.spinner("Running the Canadian FWI System over the full historical record..."):
+                try:
+                    fwi_resp = requests.get(f"{API_BASE_URL}/fwi",
+                                             params={"lat": zone["lat"], "lon": zone["lon"]}, timeout=30)
+                    fwi_resp.raise_for_status()
+                    st.session_state.tab1_fwi_result = fwi_resp.json()
+                except Exception as e:
+                    st.session_state.tab1_fwi_result = None
+                    st.warning(f"Couldn't compute FWI: {e}")
+        fwi_result = st.session_state.get("tab1_fwi_result")
+        if fwi_result:
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("FWI (danger)", f"{fwi_result['fwi']} · {fwi_result['danger_class']}")
+            fc2.metric("FFMC", fwi_result["ffmc"])
+            fc3.metric("BUI", fwi_result["bui"])
+            st.caption(f"As of {fwi_result['as_of_date']} — an internationally-used, independently "
+                       f"validated fire-danger standard (Van Wagner 1987), run separately from the ML "
+                       f"model as a cross-check, not a replacement.")
+
         st.markdown("**👥 Affected population**")
         if st.button("Estimate population in this area (WorldPop)", key="tab1_pop_btn"):
-            with st.spinner("Querying WorldPop (can take up to ~20 seconds)..."):
+            with st.spinner("Querying WorldPop (can take up to ~1 minute — their server is sometimes slow)..."):
                 pop_count, pop_error = fetch_population_estimate(zone["lat"], zone["lon"])
             if pop_error:
                 st.warning(f"Couldn't get a population estimate: {pop_error}")
@@ -1209,6 +1354,7 @@ with tab1:
             st.session_state.tab1_selected_zone = None
             st.session_state.tab1_route_info = None
             st.session_state.tab1_pop_estimate = None
+            st.session_state.tab1_fwi_result = None
             st.rerun()
     else:
         st.caption("💡 Click a risk zone on the map to select it, see the route to its nearest shelter, "
@@ -1241,6 +1387,14 @@ with tab1:
                 f"{a}/{c}" if pd.notna(a) else "—"
                 for a, c in zip(nearest_shelter["available"], nearest_shelter["capacity"])
             ],
+            "Accessible? (♿/🏢/⚕️)": [
+                _acc_icon(wc, "♿") + _acc_icon(gf, "🏢") + _acc_icon(med, "⚕️")
+                for wc, gf, med in zip(
+                    nearest_shelter.get("wheelchair_accessible", pd.Series([None] * len(nearest_shelter))),
+                    nearest_shelter.get("ground_floor", pd.Series([None] * len(nearest_shelter))),
+                    nearest_shelter.get("medical_staff_onsite", pd.Series([None] * len(nearest_shelter))),
+                )
+            ],
             "Nearest Hospital": nearest_hospital["name"].values,
             "Hospital Dist (km)": nearest_hospital["distance_km"].round(1).values,
         })
@@ -1251,7 +1405,9 @@ with tab1:
         st.caption(
             "Shows Medium/High risk zones only, matched to the closest evacuee shelter "
             "(school or place of worship) and closest health facility by straight-line distance. "
-            "Distances are approximate (haversine), not driving distance."
+            "Distances are approximate (haversine), not driving distance. "
+            "**Accessible column**: ♿ wheelchair accessible, 🏢 ground floor, ⚕️ medical staff on-site "
+            "— ✗ means staff reported 'no', ❓ means not yet reported (see the update form below)."
         )
 
     st.markdown("---")
@@ -1272,11 +1428,33 @@ with tab1:
             "Currently available spots", min_value=0, max_value=int(chosen["capacity"]),
             value=int(chosen["available"]), key="shelter_update_value",
         )
+
+        update_accessibility = st.checkbox(
+            "Also update accessibility info (for elderly/disabled evacuees)",
+            key="shelter_update_acc_toggle",
+        )
+        payload = {"available": int(new_available)}
+        if update_accessibility:
+            st.caption("Only check a box if you're certain — leave unchecked if unsure rather than guessing.")
+            acc_col1, acc_col2, acc_col3 = st.columns(3)
+            payload["wheelchair_accessible"] = acc_col1.checkbox(
+                "♿ Wheelchair accessible", value=(chosen.get("wheelchair_accessible") is True),
+                key="shelter_update_wheelchair",
+            )
+            payload["ground_floor"] = acc_col2.checkbox(
+                "🏢 Ground floor", value=(chosen.get("ground_floor") is True),
+                key="shelter_update_ground_floor",
+            )
+            payload["medical_staff_onsite"] = acc_col3.checkbox(
+                "⚕️ Medical staff on-site", value=(chosen.get("medical_staff_onsite") is True),
+                key="shelter_update_medical",
+            )
+
         if st.button("Update availability", key="shelter_update_btn"):
             try:
                 resp = requests.patch(
                     f"{API_BASE_URL}/shelters/{chosen['osm_id']}/availability",
-                    json={"available": int(new_available)}, timeout=10,
+                    json=payload, timeout=10,
                 )
                 resp.raise_for_status()
                 st.success(f"✅ Updated {shelter_choice}: {new_available}/{int(chosen['capacity'])} spots available.")
@@ -1629,8 +1807,10 @@ with tab2:
             route_info2 = st.session_state.get("tab2_route_info")
             if route_info2:
                 mode_txt2 = "walking" if route_info2["mode"] == "foot" else "driving"
+                est_note2 = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
+                    if route_info2["mode"] == "foot" else ""
                 st.success(f"🛣️ Road route: **{route_info2['distance_km']:.1f} km**, "
-                           f"~**{route_info2['duration_min']:.0f} min** ({mode_txt2}) — shown on the map above.")
+                           f"~**{route_info2['duration_min']:.0f} min** ({mode_txt2}){est_note2} — shown on the map above.")
             else:
                 st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
                            "showing straight-line distance only.")
@@ -1711,6 +1891,94 @@ with tab2:
         f"🔮 Predictions powered by PHOENIX Forecast API | "
         f"Date: {date_str} | Method: Climatology | API: {API_BASE_URL}"
     )
+
+# =================================================================
+# TAB 3: Admin (password-protected)
+# =================================================================
+with tab3:
+    st.title("🔐 Admin Dashboard")
+
+    admin_password = st.text_input("Password", type="password", key="admin_pw_input")
+    correct_password = st.secrets.get("ADMIN_PASSWORD")
+
+    if not correct_password:
+        st.warning("⚠️ No `ADMIN_PASSWORD` set in Streamlit secrets — this tab can't be unlocked until "
+                   "one is added.")
+    elif not admin_password:
+        st.info("Enter the admin password to view citizen reports, shelter status, and usage stats.")
+    elif admin_password != correct_password:
+        st.error("Incorrect password.")
+    else:
+        st.success("✅ Authenticated")
+
+        st.subheader("📈 Usage & Activity")
+        try:
+            stats = requests.get(f"{API_BASE_URL}/stats", timeout=10).json()
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric("Total visits", stats["total_visits"])
+            sc2.metric("Visits (7 days)", stats["visits_last_7_days"])
+            sc3.metric("Fire reports (total)", stats["total_fire_reports"])
+            sc4.metric("Fire reports (7 days)", stats["fire_reports_last_7_days"])
+            sc5, sc6, sc7, sc8 = st.columns(4)
+            sc5.metric("Assistance requests (total)", stats.get("total_assistance_requests", 0))
+            sc6.metric("Assistance requests (7 days)", stats.get("assistance_requests_last_7_days", 0))
+            sc7.metric("Total shelter capacity", stats["total_shelter_capacity"])
+            sc8.metric("Currently available spots", stats["total_shelter_available"])
+            st.caption("⚠️ Visit counts only cover time since the last server redeploy (ephemeral "
+                       "storage) — not a lifetime total.")
+        except Exception as e:
+            st.warning(f"Couldn't load usage stats: {e}")
+
+        st.markdown("---")
+        st.subheader("♿ Evacuation Assistance Requests")
+        st.caption("Elderly or disabled evacuees (or someone calling on their behalf) who requested "
+                   "help via USSD. Prioritize these for responder follow-up.")
+        all_assist_df, all_assist_status = fetch_assistance_requests(hours=24 * 365 * 5)
+        if all_assist_status == "ok" and not all_assist_df.empty:
+            st.dataframe(all_assist_df, use_container_width=True, hide_index=True)
+            _assist_buf = io.BytesIO()
+            with pd.ExcelWriter(_assist_buf, engine="openpyxl") as writer:
+                all_assist_df.to_excel(writer, index=False, sheet_name="Assistance Requests")
+            st.download_button(
+                "📥 Download assistance requests (Excel)", data=_assist_buf.getvalue(),
+                file_name="phoenix_assistance_requests.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="admin_assistance_download",
+            )
+        else:
+            st.info("No assistance requests recorded yet.")
+
+        st.markdown("---")
+        st.subheader("📢 All Citizen Fire Reports")
+        all_reports_df, all_reports_status = fetch_fire_reports(hours=24 * 365 * 5)  # effectively "all"
+        if all_reports_status == "ok" and not all_reports_df.empty:
+            st.dataframe(all_reports_df, use_container_width=True, hide_index=True)
+            _reports_buf = io.BytesIO()
+            with pd.ExcelWriter(_reports_buf, engine="openpyxl") as writer:
+                all_reports_df.to_excel(writer, index=False, sheet_name="Fire Reports")
+            st.download_button(
+                "📥 Download reports (Excel)", data=_reports_buf.getvalue(),
+                file_name="phoenix_fire_reports.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="admin_reports_download",
+            )
+        else:
+            st.info("No fire reports recorded yet.")
+
+        st.markdown("---")
+        st.subheader("🏠 Shelter Status")
+        shelter_status = shelters_all[["name", "province", "category", "capacity", "available"]].copy()
+        shelter_status = shelter_status.sort_values("available")
+        st.dataframe(shelter_status, use_container_width=True, hide_index=True)
+        _shelters_buf = io.BytesIO()
+        with pd.ExcelWriter(_shelters_buf, engine="openpyxl") as writer:
+            shelter_status.to_excel(writer, index=False, sheet_name="Shelters")
+        st.download_button(
+            "📥 Download shelter status (Excel)", data=_shelters_buf.getvalue(),
+            file_name="phoenix_shelters.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="admin_shelters_download",
+        )
 
 # Footer
 st.markdown("---")
