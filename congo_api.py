@@ -25,11 +25,18 @@ Current monitoring (historical / latest recorded weather):
     GET  /shelters
     GET  /shelters/nearest
     GET  /alerts?date=YYYY-MM-DD
+    GET  /fwi?lat=..&lon=..            Canadian Fire Weather Index (cross-check)
 
 Crowd-sourced reports & shelter management:
     POST /fire-reports             citizen-submitted fire sighting
     GET  /fire-reports?hours=72    recent reports, newest first
+    POST /assistance-requests      evacuation-assistance request (elderly/disabled)
+    GET  /assistance-requests?hours=72
     PATCH /shelters/{osm_id}/availability   update open spots at a shelter
+
+Dashboard visit tracking & admin stats:
+    POST /track-visit
+    GET  /stats
 
 Future forecast (climatology — historical average for the same day-of-year):
     POST /predict-future           single point, future date
@@ -40,9 +47,10 @@ Future forecast (climatology — historical average for the same day-of-year):
 Africa's Talking webhooks:
     POST /ussd    USSD callback — English/French/Swahili menu, works from any
                   phone with no internet/app. Menu: 1) check the fire risk
-                  FORECAST + nearest shelter, or 2) report a fire you saw
+                  FORECAST + nearest shelter, 2) report a fire you saw
                   (crowd-sourced, saved via /fire-reports, rate-limited to
-                  1 report per phone number per hour to reduce spam).
+                  1 report per phone number per hour to reduce spam), or
+                  3) request evacuation help for an elderly/disabled person.
     POST /voice   Voice callback — speaks the alert text passed in
                   clientState when the dashboard places a call.
 """
@@ -328,6 +336,13 @@ CLIM_ENGINE = ClimatologyEngine(CLIMATE_DF)
 # Canadian Fire Weather Index (FWI) System — Van Wagner & Pickett (1985/87)
 # Independent, internationally-used fire-danger standard (used by Canada,
 # and adapted elsewhere), run alongside the ML model as a cross-check.
+#
+# No external library is used for this — every equation below is the
+# standard Van Wagner (1987) implementation written directly in pure
+# Python (math.exp/log/sqrt from the standard library only). If /fwi
+# 404s on a deployed server, it's because this route/function block
+# isn't present in the deployed copy of this file yet — not a missing
+# pip package.
 # -----------------------------------------------------------------
 # APPROXIMATIONS made for this near-equatorial region (Katanga, DRC):
 #   - The FWI System's day-length factors (Le for DMC, Lf for DC) are
@@ -425,6 +440,11 @@ def compute_fwi(lat: float, lon: float):
             else:
                 b = 6.2 * log(dmc) - 17.2
             mr_dmc = mo_dmc + 1000 * re / (48.77 + b * re)
+            # Guard: mr_dmc must exceed 20 for log(mr_dmc - 20) to be valid.
+            # In rare edge cases (e.g. very small re/b combinations) this can
+            # dip to <= 20; clamp it just above 20 instead of letting a
+            # ValueError ("math domain error") crash the whole endpoint.
+            mr_dmc = max(mr_dmc, 20.0001)
             dmc = max(244.72 - 43.43 * log(mr_dmc - 20), 0.0)
         k = 1.894 * (Tc + 1.1) * (100 - RH) * _FWI_LE_EQUATOR * 1e-6
         dmc = dmc + 100 * k
@@ -435,6 +455,8 @@ def compute_fwi(lat: float, lon: float):
             rd = 0.83 * H - 1.27
             Qo = 800 * exp(-dc / 400)
             Qr = Qo + 3.937 * rd
+            # Guard: Qr must stay positive for log(800 / Qr) to be valid.
+            Qr = max(Qr, 0.0001)
             dc = max(400 * log(800 / Qr), 0.0)
         V = max(0.36 * (Tc2 + 2.8) + _FWI_LF_EQUATOR, 0.0)
         dc = dc + 0.5 * V
@@ -455,6 +477,10 @@ def compute_fwi(lat: float, lon: float):
 
     fD = 0.626 * bui ** 0.809 + 2 if bui <= 80 else 1000 / (25 + 108.64 * exp(-0.023 * bui))
     B = 0.1 * isi * fD
+    # Guard: log(B) is only valid for B > 0; the B > 1 branch already avoids
+    # calling log on a value <= 1, so no extra clamp needed for that path,
+    # but keep B non-negative defensively.
+    B = max(B, 0.0)
     fwi_value = exp(2.72 * (0.434 * log(B)) ** 0.647) if B > 1 else B
 
     return {
