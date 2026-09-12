@@ -336,8 +336,14 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
     "voice.sandbox.africastalking.com" — it doesn't exist. Set
     AT_VOICE_USERNAME / AT_VOICE_API_KEY in Streamlit secrets to your
     production app's credentials; if those aren't set, this falls back to
-    AT_USERNAME / AT_API_KEY (which will fail if those are still "sandbox")."""
-    import json
+    AT_USERNAME / AT_API_KEY (which will fail if those are still "sandbox").
+
+    Returns the parsed JSON response on success, or {"error": <message>} on
+    ANY failure — missing config, a network exception, or a real rejection
+    from Africa's Talking. Africa's Talking's own error responses use the
+    key "errorMessage" (not "error"), so those are normalized into "error"
+    here too — callers only ever need to check for a single "error" key."""
+    import json as _json
 
     username = st.secrets.get("AT_VOICE_USERNAME") or st.secrets.get("AT_USERNAME")
     api_key = st.secrets.get("AT_VOICE_API_KEY") or st.secrets.get("AT_API_KEY")
@@ -359,11 +365,20 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
                 "username": username,
                 "from": caller_id,
                 "to": ",".join(recipients),
-                "clientState": json.dumps({"message": message, "lang": lang}),
+                "clientState": _json.dumps({"message": message, "lang": lang}),
             },
             timeout=20,
         )
-        return resp.json()
+        result = resp.json()
+        # Africa's Talking signals failure two ways: a non-2xx status code,
+        # or a 200 response body that still carries "errorMessage". Catch
+        # both here so callers never have to know which shape to check —
+        # this is also what was silently missed before (the old code only
+        # checked for a key literally named "error", so a real
+        # {"errorMessage": "..."} rejection was mistaken for success).
+        if resp.status_code >= 400 or "errorMessage" in result:
+            return {"error": result.get("errorMessage") or f"HTTP {resp.status_code}: {result}"}
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -371,8 +386,11 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
 def _voice_error_is_not_configured(error_msg: str) -> bool:
     """True only for the specific 'production Voice isn't set up yet' error
     signatures from send_voice_call_from_dashboard — NOT for genuine
-    failures (network issues, a real API rejection). Used to decide when
-    it's honest to offer the demo-audio fallback instead of a scary error."""
+    failures (network issues, a real API rejection like bad credentials).
+    Kept only for labeling/context in the error message shown to the user —
+    the actual demo audio is now its own always-available button, so this
+    no longer gates whether a demo can be played, only how the real-call
+    error is explained."""
     if not error_msg:
         return False
     signatures = ("not set in Streamlit secrets", "doesn't accept sandbox credentials")
@@ -382,8 +400,8 @@ def _voice_error_is_not_configured(error_msg: str) -> bool:
 def generate_demo_voice_audio(text: str, lang: str = "en"):
     """Converts text to REAL, audible speech (MP3 bytes) using gTTS — free,
     no account needed. This is genuinely real audio, but the delivery is
-    'play in this browser', not 'ring the recipient's actual phone' — only
-    used as an honest fallback when production Voice isn't configured, and
+    'play in this browser', not 'ring the recipient's actual phone'. Always
+    available regardless of Africa's Talking configuration or credit, and
     always clearly labeled as a demo in the UI. Returns None on failure
     (e.g. no internet, rate-limited) rather than raising, so it never
     crashes the dashboard.
@@ -406,11 +424,13 @@ def generate_demo_voice_audio(text: str, lang: str = "en"):
 
 def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix: str, zone: dict = None):
     """Renders the full 'Send Real Alert' block: language picker, phone input,
-    SMS button, Voice call button, and a USSD info card. Shared by Tab 1 and
-    Tab 2. If `zone` is given (a specific clicked risk zone with lat/lon/
-    risk_level/fire_probability_pct/pm2_5/health_level/shelter_name/
-    shelter_dist), the message targets that exact spot instead of the
-    dashboard-wide zone count."""
+    SMS button, Voice call button, and a standalone Demo Audio button that's
+    always available (no Africa's Talking credit or production account
+    needed) — plus a USSD info card. Shared by Tab 1 and Tab 2. If `zone` is
+    given (a specific clicked risk zone with lat/lon/risk_level/
+    fire_probability_pct/pm2_5/health_level/shelter_name/shelter_dist), the
+    message targets that exact spot instead of the dashboard-wide zone
+    count."""
     if zone:
         st.subheader("📱☎️ Send Alert for Selected Zone")
         st.caption(f"Targeting the zone at ({zone['lat']:.3f}, {zone['lon']:.3f}) — "
@@ -426,7 +446,12 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
     else:
         message = build_alert_message(zone_count, ref_date_str, lang)
 
-    col_sms, col_voice = st.columns(2)
+    # Three independent options: real SMS, real Voice call (Africa's
+    # Talking, needs production credit), and a demo audio preview (gTTS,
+    # always free/available). None of these depends on another failing —
+    # the demo button works whether or not Voice is configured.
+    col_sms, col_voice, col_demo = st.columns(3)
+
     with col_sms:
         if st.button("🚨 Send SMS Now", type="primary", key=f"{key_prefix}_sms_btn"):
             if not recipient_input.startswith("+"):
@@ -438,8 +463,9 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                     st.error(f"Failed: {sms_result['error']}")
                 else:
                     st.success(f"Sent! Response: {sms_result}")
+
     with col_voice:
-        if st.button("☎️ Call Now", key=f"{key_prefix}_voice_btn"):
+        if st.button("☎️ Call Now (Africa's Talking)", key=f"{key_prefix}_voice_btn"):
             if not recipient_input.startswith("+"):
                 st.error("Enter the number in international format, e.g. +243800000001")
             else:
@@ -452,35 +478,38 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                     )
                 if "error" not in voice_result:
                     st.success(f"Call placed! Response: {voice_result}")
-                elif _voice_error_is_not_configured(voice_result["error"]):
-                    # Production Voice isn't set up — offer real, audible demo
-                    # audio instead of a bare error, clearly labeled as a demo
-                    # so it's never mistaken for a call that reached the
-                    # recipient's actual phone.
-                    st.warning("⚠️ Real Voice calling isn't configured yet (no production Africa's Talking "
-                               "account). Here's a **demo** of what the call would say — this plays in "
-                               "your browser only, it does **not** ring the recipient's phone.")
-                    with st.spinner("Generating demo audio..."):
-                        demo_audio = generate_demo_voice_audio(voice_message.split("\n---\n")[0], voice_lang)
-                    if demo_audio:
-                        st.audio(demo_audio, format="audio/mp3")
-                        st.caption("🔊 Real audio (Google Text-to-Speech, free/unofficial) — for production, "
-                                   "the same text is instead read aloud over an actual phone call once a "
-                                   "live Africa's Talking Voice account is configured.")
-                    else:
-                        st.caption("Couldn't generate demo audio right now (no internet, or the free TTS "
-                                   "service is temporarily unavailable) — this is unrelated to Voice calling "
-                                   "itself.")
                 else:
-                    # A genuine failure (network issue, real API rejection) —
-                    # show it plainly, never hide it behind the demo fallback.
-                    st.error(f"Failed: {voice_result['error']}")
+                    st.error(f"Call failed: {voice_result['error']}")
+                    if _voice_error_is_not_configured(voice_result["error"]):
+                        st.caption("⚠️ Production Africa's Talking Voice isn't set up yet (sandbox "
+                                   "credentials aren't accepted for Voice). Use **🔊 Demo Audio** "
+                                   "instead to preview what the call would say.")
+                    else:
+                        st.caption("💡 If you don't have Africa's Talking credit/production access "
+                                   "right now, use **🔊 Demo Audio** instead to preview the message.")
+
+    with col_demo:
+        if st.button("🔊 Demo Audio", key=f"{key_prefix}_demo_btn"):
+            voice_lang = "en" if lang == "all" else lang
+            voice_message = (build_zone_alert_message(zone, voice_lang) if zone
+                              else build_alert_message(zone_count, ref_date_str, voice_lang))
+            with st.spinner("Generating demo audio..."):
+                demo_audio = generate_demo_voice_audio(voice_message.split("\n---\n")[0], voice_lang)
+            if demo_audio:
+                st.audio(demo_audio, format="audio/mp3")
+                st.caption("🔊 Real audio (Google Text-to-Speech, free/unofficial) — plays in your "
+                           "browser only, does **not** ring anyone's actual phone. Always available, "
+                           "no Africa's Talking account or credit needed.")
+            else:
+                st.caption("Couldn't generate demo audio right now (no internet, or the free TTS "
+                           "service is temporarily unavailable) — unrelated to Africa's Talking Voice.")
 
     st.caption(
         "⚠️ SMS sends for free in the Sandbox. **Voice calls require a live production Africa's "
-        "Talking app** (sandbox credentials aren't accepted for Voice at all) — set "
+        "Talking app with credit** (sandbox credentials aren't accepted for Voice at all) — set "
         "`AT_VOICE_USERNAME` / `AT_VOICE_API_KEY` / `AT_VOICE_CALLER_ID` in Streamlit secrets, and "
-        "test with your own number first since every call is billed for real."
+        "test with your own number first since every call is billed for real. **Demo Audio** needs "
+        "none of that — it's a free browser preview any time."
     )
 
     st.markdown(
@@ -1939,7 +1968,8 @@ with tab2:
     st.markdown("---")
 
     # ---------------------------------------------------------------
-    # Real alert dispatch: SMS + Voice + USSD info (Africa's Talking)
+    # Real alert dispatch: SMS + Voice + Demo Audio + USSD info
+    # (Africa's Talking)
     # ---------------------------------------------------------------
     render_alert_dispatch_section(len(high_risk), date_str, key_prefix="tab2")
 
