@@ -12,3 +12,4 @@ requests
 plotly
 reportlab
 gTTS
+openpyxl
