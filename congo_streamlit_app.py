@@ -368,6 +368,42 @@ def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "
         return {"error": str(e)}
 
 
+def _voice_error_is_not_configured(error_msg: str) -> bool:
+    """True only for the specific 'production Voice isn't set up yet' error
+    signatures from send_voice_call_from_dashboard — NOT for genuine
+    failures (network issues, a real API rejection). Used to decide when
+    it's honest to offer the demo-audio fallback instead of a scary error."""
+    if not error_msg:
+        return False
+    signatures = ("not set in Streamlit secrets", "doesn't accept sandbox credentials")
+    return any(sig in error_msg for sig in signatures)
+
+
+def generate_demo_voice_audio(text: str, lang: str = "en"):
+    """Converts text to REAL, audible speech (MP3 bytes) using gTTS — free,
+    no account needed. This is genuinely real audio, but the delivery is
+    'play in this browser', not 'ring the recipient's actual phone' — only
+    used as an honest fallback when production Voice isn't configured, and
+    always clearly labeled as a demo in the UI. Returns None on failure
+    (e.g. no internet, rate-limited) rather than raising, so it never
+    crashes the dashboard.
+
+    NOTE: gTTS is an unofficial wrapper around Google Translate's TTS
+    endpoint — free and works well, but not an officially supported Google
+    API, so it can change or rate-limit without notice. Fine for demos;
+    don't treat it as guaranteed production infrastructure."""
+    try:
+        from gtts import gTTS
+        gtts_lang = {"en": "en", "fr": "fr", "sw": "sw"}.get(lang, "en")
+        tts = gTTS(text=text, lang=gtts_lang)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
+
+
 def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix: str, zone: dict = None):
     """Renders the full 'Send Real Alert' block: language picker, phone input,
     SMS button, Voice call button, and a USSD info card. Shared by Tab 1 and
@@ -414,10 +450,31 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
                     voice_result = send_voice_call_from_dashboard(
                         [recipient_input], voice_message, voice_lang
                     )
-                if "error" in voice_result:
-                    st.error(f"Failed: {voice_result['error']}")
-                else:
+                if "error" not in voice_result:
                     st.success(f"Call placed! Response: {voice_result}")
+                elif _voice_error_is_not_configured(voice_result["error"]):
+                    # Production Voice isn't set up — offer real, audible demo
+                    # audio instead of a bare error, clearly labeled as a demo
+                    # so it's never mistaken for a call that reached the
+                    # recipient's actual phone.
+                    st.warning("⚠️ Real Voice calling isn't configured yet (no production Africa's Talking "
+                               "account). Here's a **demo** of what the call would say — this plays in "
+                               "your browser only, it does **not** ring the recipient's phone.")
+                    with st.spinner("Generating demo audio..."):
+                        demo_audio = generate_demo_voice_audio(voice_message.split("\n---\n")[0], voice_lang)
+                    if demo_audio:
+                        st.audio(demo_audio, format="audio/mp3")
+                        st.caption("🔊 Real audio (Google Text-to-Speech, free/unofficial) — for production, "
+                                   "the same text is instead read aloud over an actual phone call once a "
+                                   "live Africa's Talking Voice account is configured.")
+                    else:
+                        st.caption("Couldn't generate demo audio right now (no internet, or the free TTS "
+                                   "service is temporarily unavailable) — this is unrelated to Voice calling "
+                                   "itself.")
+                else:
+                    # A genuine failure (network issue, real API rejection) —
+                    # show it plainly, never hide it behind the demo fallback.
+                    st.error(f"Failed: {voice_result['error']}")
 
     st.caption(
         "⚠️ SMS sends for free in the Sandbox. **Voice calls require a live production Africa's "
