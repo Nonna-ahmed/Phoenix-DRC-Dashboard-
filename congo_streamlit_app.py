@@ -34,7 +34,7 @@ from risk_engine import get_alert
 # -------------------------------------------------------------
 # API Config (Future Prediction)
 # -------------------------------------------------------------
-API_BASE_URL = "https://phoenix-drc-api-production.up.railway.app"
+API_BASE_URL = "https://phoenix-drc-dashboard-production.up.railway.app"
 
 @st.cache_data(ttl=300)
 def fetch_risk_map_future(target_date: str):
