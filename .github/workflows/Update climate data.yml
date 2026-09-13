@@ -1,14 +1,15 @@
+```yaml
 name: Update data & send alerts
 
 on:
   schedule:
     # Runs daily at 03:00 UTC. NASA POWER's own processing lag means the
     # most recent 3-5 days will still show as missing right after this
-    # runs — that's expected, not a failure of this workflow. Air quality
-    # changes faster than climate; if you want it refreshed more often,
-    # add a second cron entry here (e.g. "0 */6 * * *" for every 6 hours)
-    # and skip the climate/alert steps on those extra runs.
+    # runs — that's expected, not a failure of this workflow.
+    # Air quality changes faster than climate; if you want it refreshed
+    # more often, add a second cron entry here.
     - cron: "0 3 * * *"
+
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -17,6 +18,7 @@ permissions:
 jobs:
   update-data:
     runs-on: ubuntu-latest
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,20 +32,37 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Fetch latest NASA POWER climate data
-        run: python update_climate_data.py
+        run: |
+          python update_climate_data.py --region congo
+          python update_climate_data.py --region algeria
 
       - name: Fetch latest shelter air quality
-        run: python update_shelter_air_quality.py
+        run: |
+          python update_shelter_air_quality.py --region congo
+          python update_shelter_air_quality.py --region algeria
 
       - name: Commit and push if the data changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- phoenix_climate_2020_2026.csv drc_katanga_shelters_final.csv; then
+
+          if git diff --quiet -- \
+            phoenix_climate_2020_2026.csv \
+            drc_katanga_shelters_final.csv \
+            north_algeria_climate_final.csv \
+            north_algeria_shelters_final.csv; then
+
             echo "No changes to commit."
+
           else
-            git add phoenix_climate_2020_2026.csv drc_katanga_shelters_final.csv
+            git add \
+              phoenix_climate_2020_2026.csv \
+              drc_katanga_shelters_final.csv \
+              north_algeria_climate_final.csv \
+              north_algeria_shelters_final.csv
+
             git commit -m "Auto-update climate & air quality data ($(date -u +'%Y-%m-%d'))"
+
             git pull --rebase --autostash origin main
             git push
           fi
@@ -52,4 +71,7 @@ jobs:
         env:
           AT_USERNAME: ${{ secrets.AT_USERNAME }}
           AT_API_KEY: ${{ secrets.AT_API_KEY }}
-        run: python send_scheduled_alerts.py
+        run: |
+          python send_scheduled_alerts.py --region congo
+          python send_scheduled_alerts.py --region algeria
+```
