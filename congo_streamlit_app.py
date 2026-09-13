@@ -1,7 +1,8 @@
 """
-PHOENIX — Congo (Katanga) Wildfire Early Warning & Shelter Matching Dashboard
+PHOENIX — Multi-Region Wildfire Early Warning & Shelter Matching Dashboard
 ================================================================================
-Updated with Future Prediction Tab (calls Railway API)
+Now covers Congo (Katanga) AND northern Algeria — pick a region from the
+sidebar. Adding a third region means editing regions.py only.
 
 PERFORMANCE: batched PM2.5, cached predictions, vectorized GeoJson risk zones.
 
@@ -10,8 +11,10 @@ Run locally:
     streamlit run congo_streamlit_app.py
 
 Files needed in the same folder:
-    congo_predict.py, congo_fire_risk_model.json, risk_engine.py, air_quality.py,
-    phoenix_climate_2020_2026.csv, drc_katanga_shelters_final.csv
+    regions.py, congo_predict.py, congo_fire_risk_model.json, risk_engine.py,
+    air_quality.py, phoenix_climate_2020_2026.csv, drc_katanga_shelters_final.csv,
+    north_algeria_climate_final.csv, north_algeria_shelters_final.csv,
+    north_algeria_fire_risk_model.json
 """
 
 import streamlit as st
@@ -28,18 +31,35 @@ from math import radians, sin, cos, sqrt, atan2
 import plotly.express as px
 from datetime import date, timedelta
 
-from congo_predict import predict_fire_risk
+from congo_predict import predict_fire_risk as congo_predict_fire_risk
 from risk_engine import get_alert
+import regions as region_config
 
 # -------------------------------------------------------------
-# API Config (Future Prediction)
+# Region-aware prediction — Congo keeps using congo_predict.py exactly as
+# before (unchanged, tested behavior); every other region routes through
+# the generic XGBoost predictor in regions.py, which was confirmed to
+# share the same 8-feature schema.
 # -------------------------------------------------------------
-API_BASE_URL = "https://phoenix-drc-dashboard-production.up.railway.app"
+def predict_fire_risk_for_region(region_id: str, **kwargs) -> dict:
+    cfg = region_config.get_region(region_id)
+    if cfg.get("use_congo_predict", region_id == "congo"):
+        return congo_predict_fire_risk(**kwargs)
+    return region_config.predict_fire_risk_generic(region_id, **kwargs)
+
+
+# -------------------------------------------------------------
+# API Config (Future Prediction) — same Railway API serves every region;
+# every call below now forwards ?region=... so the API loads the right
+# climate/shelters/model files.
+# -------------------------------------------------------------
+API_BASE_URL = "https://phoenix-drc-api-production.up.railway.app"
 
 @st.cache_data(ttl=300)
-def fetch_risk_map_future(target_date: str):
+def fetch_risk_map_future(target_date: str, region_id: str):
     try:
-        resp = requests.get(f"{API_BASE_URL}/risk-map-future", params={"date": target_date}, timeout=60)
+        resp = requests.get(f"{API_BASE_URL}/risk-map-future",
+                             params={"date": target_date, "region": region_id}, timeout=60)
         resp.raise_for_status()
         return resp.json()
     except Exception:
@@ -55,7 +75,7 @@ def check_api_health():
 # -------------------------------------------------------------
 # Page setup
 # -------------------------------------------------------------
-st.set_page_config(page_title="PHOENIX — Congo Fire Early Warning", layout="wide")
+st.set_page_config(page_title="PHOENIX — Wildfire Early Warning", layout="wide")
 
 COLOR_MAP = {"Low": "green", "Medium": "orange", "High": "red"}
 FUTURE_COLOR_MAP = {"High": "#e74c3c", "Moderate": "#f39c12", "Low": "#27ae60"}
@@ -149,11 +169,9 @@ def fetch_route(start_lat, start_lon, end_lat, end_lon, profile="foot"):
         return None, None, None
 
 
-MAJOR_TOWNS = {
-    "Lubumbashi (Haut-Katanga)": (-11.6609, 27.4794),
-    "Kolwezi (Lualaba)": (-10.7167, 25.4667),
-    "Kalemie (Tanganyika)": (-5.9475, 29.1947),
-}
+# MAJOR_TOWNS used to be hardcoded here for Congo only — now sourced from
+# the selected region's config (region_cfg["province_ref_points"]) at the
+# point of use, further down in the file, so this works for any region.
 
 
 def render_nearest_shelters(shelters_all: pd.DataFrame, ref_lat: float, ref_lon: float,
@@ -235,49 +253,65 @@ def send_sms_from_dashboard(recipients: list, message: str) -> dict:
 # -------------------------------------------------------------
 # Bilingual alert text (English / French)
 # -------------------------------------------------------------
-# USSD code assigned by Africa's Talking's Sandbox for this app's USSD
-# channel (pointed at {API_BASE_URL}/ussd). Production (real telecom
-# delivery, not just the Sandbox simulator) requires applying separately
-# with DRC's regulator — ARPTC — for a dedicated/shared code there.
-USSD_SERVICE_CODE = "*384*99838#"
+# USSD_SERVICE_CODE is set from the selected region's config further down
+# (after region_cfg exists) — region_config.get_region(region_id)["ussd_code"].
+# It's None for any region not yet registered with Africa's Talking (e.g.
+# Algeria at the time of writing); every place below that uses it checks
+# for None and omits the USSD-specific text/card instead of printing
+# "None" or showing a code that doesn't actually work.
+# -------------------------------------------------------------
+USSD_SERVICE_CODE = None
 
 _ALERT_TEMPLATES = {
     "en": "[PHOENIX ALERT] High wildfire risk detected. {count} zone(s) currently High risk "
-          "as of {date}. Move livestock/valuables now. No smartphone? Dial {ussd} from any "
-          "phone for shelter info — no internet needed.",
+          "as of {date}. Move livestock/valuables now.{ussd_line}",
     "fr": "[ALERTE PHOENIX] Risque élevé d'incendie détecté. {count} zone(s) actuellement à "
-          "haut risque au {date}. Déplacez le bétail/les biens de valeur maintenant. Pas de "
-          "smartphone ? Composez {ussd} depuis n'importe quel téléphone pour les infos abris "
-          "— sans internet.",
+          "haut risque au {date}. Déplacez le bétail/les biens de valeur maintenant.{ussd_line}",
     "sw": "[TAHADHARI YA PHOENIX] Hatari kubwa ya moto imegunduliwa. Maeneo {count} yana hatari "
-          "kubwa kufikia {date}. Hamisha mifugo/vitu vya thamani sasa. Huna simu janja? Piga "
-          "{ussd} kutoka simu yoyote kwa taarifa za makazi — hauitaji intaneti.",
+          "kubwa kufikia {date}. Hamisha mifugo/vitu vya thamani sasa.{ussd_line}",
+    "ar": "[تنبيه فينيكس] تم رصد خطر حريق مرتفع. عدد المناطق ذات الخطورة المرتفعة حاليًا: {count} "
+          "اعتبارًا من {date}. انقل الماشية/الممتلكات القيمة الآن.{ussd_line}",
 }
 
-_LANG_LABELS = {"en": "English", "fr": "Français", "sw": "Kiswahili"}
+_USSD_LINE_TEMPLATES = {
+    "en": " No smartphone? Dial {ussd} from any phone for shelter info — no internet needed.",
+    "fr": " Pas de smartphone ? Composez {ussd} depuis n'importe quel téléphone pour les infos "
+          "abris — sans internet.",
+    "sw": " Huna simu janja? Piga {ussd} kutoka simu yoyote kwa taarifa za makazi — hauitaji intaneti.",
+    "ar": " ليس لديك هاتف ذكي؟ اتصل بـ {ussd} من أي هاتف للحصول على معلومات الملجأ — بدون إنترنت.",
+}
+
+_LANG_LABELS = {"en": "English", "fr": "Français", "sw": "Kiswahili", "ar": "العربية"}
+
+
+def _ussd_line(lang: str) -> str:
+    """Empty string if this region has no USSD code registered yet —
+    never renders a literal 'None' or advertises a non-working code."""
+    if not USSD_SERVICE_CODE:
+        return ""
+    return _USSD_LINE_TEMPLATES[lang].format(ussd=USSD_SERVICE_CODE)
 
 
 def build_alert_message(count: int, date_str: str, lang: str) -> str:
-    """Builds the alert text in English, French, Swahili, or all three
-    (lang: 'en', 'fr', 'sw', 'all')."""
+    """Builds the alert text in any language the current region supports,
+    or all of them at once (lang == 'all')."""
+    def render(l: str) -> str:
+        return _ALERT_TEMPLATES[l].format(count=count, date=date_str, ussd_line=_ussd_line(l))
+
     if lang == "all":
-        return "\n---\n".join(
-            _ALERT_TEMPLATES[l].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
-            for l in ("en", "fr", "sw")
-        )
-    return _ALERT_TEMPLATES[lang].format(count=count, date=date_str, ussd=USSD_SERVICE_CODE)
+        return "\n---\n".join(render(l) for l in region_cfg["languages"])
+    return render(lang)
 
 
 _ZONE_ALERT_TEMPLATES = {
     "en": "[PHOENIX ALERT] High wildfire risk at ({lat}, {lon}). Risk: {risk} ({prob}). "
-          "{aqi} Nearest shelter: {shelter} ({dist}). Move now. Dial {ussd} for more info "
-          "— no internet needed.",
+          "{aqi} Nearest shelter: {shelter} ({dist}). Move now.{ussd_line}",
     "fr": "[ALERTE PHOENIX] Risque élevé d'incendie à ({lat}, {lon}). Risque : {risk} ({prob}). "
-          "{aqi} Abri le plus proche : {shelter} ({dist}). Déplacez-vous maintenant. Composez "
-          "{ussd} pour plus d'infos — sans internet.",
+          "{aqi} Abri le plus proche : {shelter} ({dist}). Déplacez-vous maintenant.{ussd_line}",
     "sw": "[TAHADHARI YA PHOENIX] Hatari kubwa ya moto karibu na ({lat}, {lon}). Hatari: {risk} "
-          "({prob}). {aqi} Makazi ya karibu: {shelter} ({dist}). Hamia sasa. Piga {ussd} kwa "
-          "maelezo zaidi — hauitaji intaneti.",
+          "({prob}). {aqi} Makazi ya karibu: {shelter} ({dist}). Hamia sasa.{ussd_line}",
+    "ar": "[تنبيه فينيكس] خطر حريق مرتفع بالقرب من ({lat}, {lon}). الخطورة: {risk} ({prob}). "
+          "{aqi} أقرب ملجأ: {shelter} ({dist}). انتقل الآن.{ussd_line}",
 }
 
 
@@ -292,36 +326,38 @@ def build_zone_alert_message(zone: dict, lang: str) -> str:
                 "en": f"Air quality: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
                 "fr": f"Qualité de l'air : {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
                 "sw": f"Ubora wa hewa: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
+                "ar": f"جودة الهواء: {zone['pm2_5']:.0f} µg/m³ ({zone.get('health_level') or 'N/A'}).",
             }
         else:
             aqi_texts = {
                 "en": "Air quality: no live data.",
                 "fr": "Qualité de l'air : pas de données en direct.",
                 "sw": "Ubora wa hewa: hakuna data ya sasa.",
+                "ar": "جودة الهواء: لا توجد بيانات حية.",
             }
-        not_found = {"en": "Not found", "fr": "Introuvable", "sw": "Haipatikani"}
+        not_found = {"en": "Not found", "fr": "Introuvable", "sw": "Haipatikani", "ar": "غير موجود"}
         shelter = zone.get("shelter_name") or not_found[single_lang]
         dist = f"{zone['shelter_dist']:.1f} km" if zone.get("shelter_dist") is not None else "?"
         return _ZONE_ALERT_TEMPLATES[single_lang].format(
             lat=round(zone["lat"], 3), lon=round(zone["lon"], 3),
             risk=zone.get("risk_level") or "N/A", prob=prob, aqi=aqi_texts[single_lang],
-            shelter=shelter, dist=dist, ussd=USSD_SERVICE_CODE,
+            shelter=shelter, dist=dist, ussd_line=_ussd_line(single_lang),
         )
 
     if lang == "all":
-        return "\n---\n".join(render(l) for l in ("en", "fr", "sw"))
+        return "\n---\n".join(render(l) for l in region_cfg["languages"])
     return render(lang)
 
 
 def render_language_picker(key: str) -> str:
-    """Renders a language selector and returns 'en' / 'fr' / 'sw' / 'all'."""
-    choice = st.radio(
-        "Alert language / Langue de l'alerte / Lugha ya tahadhari",
-        ["English", "Français", "Kiswahili", "All / Tous / Zote"],
-        horizontal=True,
-        key=key,
-    )
-    return {"English": "en", "Français": "fr", "Kiswahili": "sw", "All / Tous / Zote": "all"}[choice]
+    """Renders a language selector scoped to the CURRENTLY SELECTED
+    region's supported languages (region_cfg["languages"]) plus an 'All'
+    option, and returns the chosen language code (or 'all')."""
+    options = [_LANG_LABELS[code] for code in region_cfg["languages"]] + ["All languages"]
+    choice = st.radio("Alert language", options, horizontal=True, key=key)
+    if choice == "All languages":
+        return "all"
+    return next(code for code in region_cfg["languages"] if _LANG_LABELS[code] == choice)
 
 
 def send_voice_call_from_dashboard(recipients: list, message: str, lang: str = "en") -> dict:
@@ -512,28 +548,30 @@ def render_alert_dispatch_section(zone_count: int, ref_date_str: str, key_prefix
         "none of that — it's a free browser preview any time."
     )
 
-    st.markdown(
-        f"""
-        <div style="border:1px solid #90caf9;background:#e3f2fd;border-radius:10px;padding:12px;margin-top:10px;">
-            <b>📟 No smartphone? No internet? No problem.</b><br>
-            <span style="font-size:14px;">
-            Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check the current fire risk,
-            find the nearest shelter, report a fire, or <b>request evacuation help for an elderly or
-            disabled person</b> — works on any network, no app or data connection needed, in English,
-            French, or Swahili.<br>
-            <i>Composez {USSD_SERVICE_CODE} depuis n'importe quel téléphone pour vérifier le risque
-            d'incendie, trouver un abri, signaler un incendie, ou demander de l'aide pour une évacuation
-            (personnes âgées ou handicapées) — sans internet ni application.</i>
-            </span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if USSD_SERVICE_CODE:
+        _lang_names = ", ".join(_LANG_LABELS[c] for c in region_cfg["languages"])
+        st.markdown(
+            f"""
+            <div style="border:1px solid #90caf9;background:#e3f2fd;border-radius:10px;padding:12px;margin-top:10px;">
+                <b>📟 No smartphone? No internet? No problem.</b><br>
+                <span style="font-size:14px;">
+                Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check the current fire risk,
+                find the nearest shelter, report a fire, or <b>request evacuation help for an elderly or
+                disabled person</b> — works on any network, no app or data connection needed, in {_lang_names}.
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(f"📟 USSD (no-internet phone access) isn't registered yet for "
+                   f"{region_cfg['flag']} {region_cfg['label']} — SMS, Voice, and Demo Audio above "
+                   f"still work regardless.")
 
 
 @st.cache_data
-def load_climate():
-    df = pd.read_csv("phoenix_climate_2020_2026.csv")
+def load_climate(climate_csv: str):
+    df = pd.read_csv(climate_csv)
     # NASA POWER has a ~3-5 day processing lag; the most recent unprocessed
     # days come back as the fill value -999 instead of real numbers. Mark
     # those as NaN (don't drop the row) so the date itself still counts as
@@ -552,9 +590,9 @@ def load_climate():
     return df
 
 @st.cache_data
-def load_shelters():
-    df = pd.read_csv("drc_katanga_shelters_final.csv")
-    df = df.rename(columns={"capacity_estimate": "capacity"})
+def load_shelters(shelters_csv: str):
+    df = pd.read_csv(shelters_csv)
+    df = df.rename(columns={"capacity_estimate": "capacity"})  # no-op for files already using "capacity"
     df["name"] = df["name"].fillna(df["category"] + " (unnamed)")
     df["capacity"] = pd.to_numeric(df["capacity"], errors="coerce").fillna(25).astype(int)
     if "available" not in df.columns:
@@ -565,11 +603,42 @@ def load_shelters():
     for col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
         if col not in df.columns:
             df[col] = None
-    return df[["osm_id", "category", "name", "lat", "lon", "capacity", "available",
-               "is_shelter", "province", "pm2_5", "us_aqi", "observation_time",
-               "wheelchair_accessible", "ground_floor", "medical_staff_onsite"]]
+    cols = ["osm_id", "category", "name", "lat", "lon", "capacity", "available",
+            "is_shelter", "province", "pm2_5", "us_aqi", "observation_time",
+            "wheelchair_accessible", "ground_floor", "medical_staff_onsite"]
+    # name_ar is present for Algeria only — keep it if it's there (useful
+    # for an Arabic-language UI later) without breaking Congo's file, which
+    # doesn't have it.
+    if "name_ar" in df.columns:
+        cols.append("name_ar")
+    return df[cols]
 
-climate = load_climate()
+
+# -------------------------------------------------------------
+# Region selector — MUST come first: everything below (which CSVs/model
+# get loaded, which provinces show up, the FIRMS bounding box, the map
+# center, which languages the alert dispatcher offers) depends on this.
+# -------------------------------------------------------------
+st.sidebar.header("🌍 Region")
+_region_labels = {rid: f"{cfg['flag']} {cfg['label']}" for rid, cfg in region_config.REGIONS.items()}
+selected_region_label = st.sidebar.selectbox(
+    "Choose region", list(_region_labels.values()), key="selected_region_label"
+)
+region_id = next(rid for rid, label in _region_labels.items() if label == selected_region_label)
+region_cfg = region_config.get_region(region_id)
+USSD_SERVICE_CODE = region_cfg["ussd_code"]  # None for any region without a registered USSD code yet
+
+# A zone/shelter/route selected under one region is meaningless (and can
+# reference coordinates that don't exist) once the person switches region
+# — clear that transient state on region change instead of carrying it
+# over. Doesn't touch anything the person explicitly typed elsewhere.
+if st.session_state.get("_active_region") != region_id:
+    for _key in ("tab1_selected_zone", "tab1_route_info", "tab1_pop_estimate", "tab1_fwi_result",
+                 "tab1_last_click_key", "tab2_selected_zone", "tab2_route_info", "tab2_last_click_key"):
+        st.session_state.pop(_key, None)
+    st.session_state["_active_region"] = region_id
+
+climate = load_climate(region_cfg["climate_csv"])
 
 # Default to the latest date where EVERY grid cell has complete data — no
 # NaN/"No data" on the default view. If the most recent day(s) still have
@@ -585,25 +654,36 @@ _complete_counts = (
 _full_coverage_dates = _complete_counts[_complete_counts == _total_cells]
 LATEST_AVAILABLE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
                           else climate["date"].max())
-shelters_all = load_shelters()
+shelters_all = load_shelters(region_cfg["shelters_csv"])
+FIRMS_BBOX = region_cfg["firms_bbox"]
 
 # -------------------------------------------------------------
 # Sidebar: choose which facility types / provinces to show
 # -------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.subheader("Locations to show on map")
-CATEGORY_LABELS = {
+# Full label set for every category seen across any region; only the
+# categories actually present in the currently-loaded shelters file are
+# shown as checkboxes below, so this works whether the file has 3
+# categories (Congo) or 5 (Algeria, which adds fire_station and
+# emergency_shelter).
+_ALL_CATEGORY_LABELS = {
     "school": "🏫 Schools (evacuee shelters)",
     "place_of_worship": "🕌 Places of worship (evacuee shelters)",
+    "emergency_shelter": "⛺ Emergency shelters",
     "health_facility": "🏥 Health facilities (support only)",
+    "fire_station": "🚒 Fire stations (support only)",
 }
+_categories_present = [c for c in _ALL_CATEGORY_LABELS if c in shelters_all["category"].unique()]
+_default_shelter_categories = {"school", "place_of_worship", "emergency_shelter"}
 selected_categories = [
-    cat for cat, label in CATEGORY_LABELS.items()
-    if st.sidebar.checkbox(label, value=(cat in ["school", "place_of_worship"]))
+    cat for cat in _categories_present
+    if st.sidebar.checkbox(_ALL_CATEGORY_LABELS[cat], value=(cat in _default_shelter_categories), key=f"cat_{cat}")
 ]
 
 provinces = sorted(shelters_all["province"].dropna().unique())
 selected_provinces = st.sidebar.multiselect("Provinces", provinces, default=provinces)
+
 
 shelters = shelters_all[
     shelters_all["category"].isin(selected_categories) &
@@ -692,8 +772,9 @@ def fetch_pm25_batch(lat_lon_pairs, chunk_size=30):
 # -------------------------------------------------------------
 # NASA FIRMS — confirmed active fire detections (satellite, NOT prediction)
 # -------------------------------------------------------------
-# Bounding box covering Haut-Katanga, Lualaba & Tanganyika: west,south,east,north
-FIRMS_BBOX = "24,-13,31,-4"
+# FIRMS_BBOX is set from the selected region's config above
+# (region_cfg["firms_bbox"]) — was hardcoded to Congo's box here
+# previously; now read from the global set earlier in the script.
 FIRMS_SOURCE = "VIIRS_NOAA20_NRT"  # near-real-time VIIRS/NOAA-20 detections
 FIRMS_DAY_RANGE = 2  # last 2 days of detections
 
@@ -701,11 +782,12 @@ FIRMS_DAY_RANGE = 2  # last 2 days of detections
 @st.cache_data(ttl=1800)  # FIRMS refreshes every few hours; 30 min cache is plenty
 def fetch_active_fires():
     """Fetches CONFIRMED active fire detections from NASA FIRMS (satellite
-    hotspots — actually observed, not predicted) for the Katanga bounding
-    box. Requires a free MAP_KEY (see https://firms.modaps.eosdis.nasa.gov/api/map_key/)
-    in Streamlit secrets as FIRMS_MAP_KEY. Returns an empty DataFrame (not
-    an error) if the key is missing or the request fails, so this never
-    blocks the rest of the dashboard from working."""
+    hotspots — actually observed, not predicted) for the SELECTED REGION's
+    bounding box (region_cfg["firms_bbox"]). Requires a free MAP_KEY (see
+    https://firms.modaps.eosdis.nasa.gov/api/map_key/) in Streamlit
+    secrets as FIRMS_MAP_KEY. Returns an empty DataFrame (not an error) if
+    the key is missing or the request fails, so this never blocks the rest
+    of the dashboard from working."""
     map_key = st.secrets.get("FIRMS_MAP_KEY")
     if not map_key:
         return pd.DataFrame(), "no_key"
@@ -722,14 +804,16 @@ def fetch_active_fires():
 
 
 @st.cache_data(ttl=180)  # short cache — citizen reports should feel near-live
-def fetch_fire_reports(hours: int = 72):
+def fetch_fire_reports(region_id: str, hours: int = 72):
     """Fetches recent citizen-submitted fire reports from the API
-    (crowd-sourced via the USSD 'Report a fire' menu). Returns an empty
-    DataFrame (not an error) on any failure, so this never blocks the rest
-    of the dashboard. Default 72h for the map overlay; the Admin tab passes
-    a much larger window to see the full history."""
+    (crowd-sourced via the USSD 'Report a fire' menu), scoped to one
+    region. Returns an empty DataFrame (not an error) on any failure, so
+    this never blocks the rest of the dashboard. Default 72h for the map
+    overlay; the Admin tab passes a much larger window to see the full
+    history."""
     try:
-        resp = requests.get(f"{API_BASE_URL}/fire-reports", params={"hours": hours}, timeout=10)
+        resp = requests.get(f"{API_BASE_URL}/fire-reports",
+                             params={"hours": hours, "region": region_id}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -740,11 +824,13 @@ def fetch_fire_reports(hours: int = 72):
 
 
 @st.cache_data(ttl=180)
-def fetch_assistance_requests(hours: int = 72):
+def fetch_assistance_requests(region_id: str, hours: int = 72):
     """Fetches recent evacuation-assistance requests (elderly/disabled
-    evacuees needing help) from the API. Same shape as fetch_fire_reports."""
+    evacuees needing help) from the API, scoped to one region. Same shape
+    as fetch_fire_reports."""
     try:
-        resp = requests.get(f"{API_BASE_URL}/assistance-requests", params={"hours": hours}, timeout=10)
+        resp = requests.get(f"{API_BASE_URL}/assistance-requests",
+                             params={"hours": hours, "region": region_id}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -923,12 +1009,14 @@ def build_area_report_pdf(zone: dict, shelters_all: pd.DataFrame, fires_df: pd.D
         story.append(Paragraph("No confirmed-fire data available right now.", styles["Normal"]))
     story.append(Spacer(1, 0.8 * cm))
 
-    story.append(Paragraph("No Internet? No Smartphone?", styles["Heading2"]))
-    story.append(Paragraph(
-        f"Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check current fire risk and the "
-        f"nearest shelter — works on any network, no app or data connection needed, in English, "
-        f"French, or Swahili.", styles["Normal"],
-    ))
+    if USSD_SERVICE_CODE:
+        _lang_names_pdf = ", ".join(_LANG_LABELS[c] for c in region_cfg["languages"])
+        story.append(Paragraph("No Internet? No Smartphone?", styles["Heading2"]))
+        story.append(Paragraph(
+            f"Dial <b>{USSD_SERVICE_CODE}</b> from any basic phone to check current fire risk and the "
+            f"nearest shelter — works on any network, no app or data connection needed, in "
+            f"{_lang_names_pdf}.", styles["Normal"],
+        ))
 
     doc.build(story)
     return buffer.getvalue()
@@ -938,7 +1026,7 @@ def build_area_report_pdf(zone: dict, shelters_all: pd.DataFrame, fires_df: pd.D
 # PERFORMANCE FIX: cache predictions per date
 # -------------------------------------------------------------
 @st.cache_data(ttl=900)
-def compute_results_for_date(day_data_records, doy, is_latest):
+def compute_results_for_date(day_data_records, doy, is_latest, region_id):
     pm25_lookup = {}
     if is_latest:
         pairs = [(r["LAT"], r["LON"]) for r in day_data_records]
@@ -956,8 +1044,8 @@ def compute_results_for_date(day_data_records, doy, is_latest):
             results.append(entry)
             continue
 
-        r = predict_fire_risk(
-            lat=row["LAT"], lon=row["LON"], doy=doy,
+        r = predict_fire_risk_for_region(
+            region_id, lat=row["LAT"], lon=row["LON"], doy=doy,
             t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
             rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
         )
@@ -973,14 +1061,17 @@ def compute_results_for_date(day_data_records, doy, is_latest):
     return pd.DataFrame(results), success_count, skipped_missing
 
 # -------------------------------------------------------------
-# Track this visit once per session (feeds the Admin tab's usage stats)
+# Track this visit once per session PER REGION (feeds the Admin tab's
+# usage stats, broken down by region) — re-fires if the person switches
+# region mid-session, since that's a new region actually being looked at.
 # -------------------------------------------------------------
-if "visit_tracked" not in st.session_state:
+_visit_key = f"visit_tracked_{region_id}"
+if _visit_key not in st.session_state:
     try:
-        requests.post(f"{API_BASE_URL}/track-visit", timeout=5)
+        requests.post(f"{API_BASE_URL}/track-visit", params={"region": region_id}, timeout=5)
     except Exception:
         pass  # never block the dashboard over a tracking call
-    st.session_state.visit_tracked = True
+    st.session_state[_visit_key] = True
 
 # -------------------------------------------------------------
 # Tabs
@@ -991,8 +1082,8 @@ tab1, tab2, tab3 = st.tabs(["📊 Current Monitoring", "🔮 Future Prediction",
 # TAB 1: Current Monitoring (Original Optimized Dashboard)
 # =================================================================
 with tab1:
-    st.title("🔥 PHOENIX — Congo (Katanga) Wildfire Early Warning & Shelter Matching")
-    st.caption("Haut-Katanga, Lualaba & Tanganyika provinces (DRC) — AI for All Hackathon")
+    st.title(f"🔥 PHOENIX — {region_cfg['flag']} {region_cfg['label']} Wildfire Early Warning & Shelter Matching")
+    st.caption(f"{len(region_cfg['province_ref_points'])} provinces/wilayas covered — AI for All Hackathon")
 
     day_data = climate[climate["date"] == selected_date].copy()
     doy = pd.Timestamp(selected_date).dayofyear
@@ -1010,7 +1101,7 @@ with tab1:
     show_live_aq = 0 <= days_from_latest <= 365
 
     res_df, aqi_fetch_success_count, _ = compute_results_for_date(
-        day_data.to_dict("records"), doy, show_live_aq
+        day_data.to_dict("records"), doy, show_live_aq, region_id
     )
 
     if show_live_aq:
@@ -1194,7 +1285,7 @@ with tab1:
     # ---------------------------------------------------------------
     # Citizen-reported fires (crowd-sourced via USSD "Report a fire")
     # ---------------------------------------------------------------
-    reports_df, reports_status = fetch_fire_reports()
+    reports_df, reports_status = fetch_fire_reports(region_id)
     if reports_status == "ok" and not reports_df.empty:
         reports_fg = folium.FeatureGroup(name="📢 Citizen fire reports (last 72h)", show=True)
         for _, rep in reports_df.iterrows():
@@ -1216,7 +1307,7 @@ with tab1:
     # ---------------------------------------------------------------
     # Evacuation assistance requests (elderly/disabled needing help)
     # ---------------------------------------------------------------
-    assist_df, assist_status = fetch_assistance_requests()
+    assist_df, assist_status = fetch_assistance_requests(region_id)
     if assist_status == "ok" and not assist_df.empty:
         assist_fg = folium.FeatureGroup(name="♿ Evacuation assistance needed (last 72h)", show=True)
         for _, req in assist_df.iterrows():
@@ -1395,7 +1486,8 @@ with tab1:
             with st.spinner("Running the Canadian FWI System over the full historical record..."):
                 try:
                     fwi_resp = requests.get(f"{API_BASE_URL}/fwi",
-                                             params={"lat": zone["lat"], "lon": zone["lon"]}, timeout=30)
+                                             params={"lat": zone["lat"], "lon": zone["lon"], "region": region_id},
+                                             timeout=30)
                     fwi_resp.raise_for_status()
                     st.session_state.tab1_fwi_result = fwi_resp.json()
                 except Exception as e:
@@ -1582,8 +1674,8 @@ with tab1:
                     continue
                 row = row.iloc[0]
                 checked_any = True
-                pred = predict_fire_risk(
-                    lat=g_lat, lon=g_lon, doy=check_date.dayofyear,
+                pred = predict_fire_risk_for_region(
+                    region_id, lat=g_lat, lon=g_lon, doy=check_date.dayofyear,
                     t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
                     rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
                 )
@@ -1637,8 +1729,8 @@ with tab1:
         _season_rows = []
         for month, row in _monthly_avg.iterrows():
             representative_doy = pd.Timestamp(2023, int(month), 15).dayofyear  # any non-leap year, day 15
-            pred = predict_fire_risk(
-                lat=_region_lat, lon=_region_lon, doy=representative_doy,
+            pred = predict_fire_risk_for_region(
+                region_id, lat=_region_lat, lon=_region_lon, doy=representative_doy,
                 t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"], rh2m=row["RH2M"],
                 ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
             )
@@ -1694,7 +1786,7 @@ with tab2:
     date_str = future_date.strftime("%Y-%m-%d")
 
     with st.spinner(f"🔍 Fetching predictions for {date_str}..."):
-        future_data = fetch_risk_map_future(date_str)
+        future_data = fetch_risk_map_future(date_str, region_id)
 
     if future_data is None or len(future_data) == 0:
         st.error("Failed to fetch predictions. Please try again.")
@@ -1730,8 +1822,8 @@ with tab2:
     st.subheader("🗺️ Predicted Risk Heatmap")
 
     m_future = folium.Map(
-        location=[-10.5, 27.5],
-        zoom_start=6,
+        location=list(region_cfg["map_center"]),
+        zoom_start=region_cfg["map_zoom"],
         tiles="OpenStreetMap"
     )
 
@@ -1911,8 +2003,8 @@ with tab2:
 
     st.markdown("---")
 
-    town_choice = st.selectbox("Reference town", list(MAJOR_TOWNS.keys()), key="future_ref_town")
-    ref_lat, ref_lon = MAJOR_TOWNS[town_choice]
+    town_choice = st.selectbox("Reference town", list(region_cfg["province_ref_points"].keys()), key="future_ref_town")
+    ref_lat, ref_lon = region_cfg["province_ref_points"][town_choice]
     render_nearest_shelters(shelters_all, ref_lat, ref_lon, town_choice)
 
     st.markdown("---")
@@ -1998,9 +2090,9 @@ with tab3:
     else:
         st.success("✅ Authenticated")
 
-        st.subheader("📈 Usage & Activity")
+        st.subheader(f"📈 Usage & Activity — {region_cfg['flag']} {region_cfg['label']}")
         try:
-            stats = requests.get(f"{API_BASE_URL}/stats", timeout=10).json()
+            stats = requests.get(f"{API_BASE_URL}/stats", params={"region": region_id}, timeout=10).json()
             sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Total visits", stats["total_visits"])
             sc2.metric("Visits (7 days)", stats["visits_last_7_days"])
@@ -2020,7 +2112,7 @@ with tab3:
         st.subheader("♿ Evacuation Assistance Requests")
         st.caption("Elderly or disabled evacuees (or someone calling on their behalf) who requested "
                    "help via USSD. Prioritize these for responder follow-up.")
-        all_assist_df, all_assist_status = fetch_assistance_requests(hours=24 * 365 * 5)
+        all_assist_df, all_assist_status = fetch_assistance_requests(region_id, hours=24 * 365 * 5)
         if all_assist_status == "ok" and not all_assist_df.empty:
             st.dataframe(all_assist_df, use_container_width=True, hide_index=True)
             _assist_buf = io.BytesIO()
@@ -2037,7 +2129,7 @@ with tab3:
 
         st.markdown("---")
         st.subheader("📢 All Citizen Fire Reports")
-        all_reports_df, all_reports_status = fetch_fire_reports(hours=24 * 365 * 5)  # effectively "all"
+        all_reports_df, all_reports_status = fetch_fire_reports(region_id, hours=24 * 365 * 5)  # effectively "all"
         if all_reports_status == "ok" and not all_reports_df.empty:
             st.dataframe(all_reports_df, use_container_width=True, hide_index=True)
             _reports_buf = io.BytesIO()
@@ -2069,4 +2161,4 @@ with tab3:
 
 # Footer
 st.markdown("---")
-st.caption("🔥 PHOENIX DRC — Wildfire Early Warning System | Built with Streamlit")
+st.caption("🔥 PHOENIX — Multi-Region Wildfire Early Warning System | Built with Streamlit")
