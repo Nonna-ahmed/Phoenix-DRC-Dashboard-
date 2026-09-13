@@ -1,16 +1,17 @@
 """
-Update Climate Data — NASA POWER auto-refresh
-==================================================
+Update Climate Data — NASA POWER auto-refresh (multi-region)
+==================================================================
 Fetches the most recent days of weather from NASA POWER for every grid
-point already present in phoenix_climate_2020_2026.csv, and merges them
-in — replacing any existing rows for the same (LAT, LON, date) so that
-rows which were previously "-999" (not yet processed) get filled in once
-NASA POWER catches up, and today's/yesterday's data gets added as soon as
-it becomes available.
+point already present in the SELECTED REGION's climate CSV, and merges
+them in — replacing any existing rows for the same (LAT, LON, date) so
+that rows which were previously "-999" (not yet processed) get filled in
+once NASA POWER catches up, and today's/yesterday's data gets added as
+soon as it becomes available.
 
-Meant to be run on a schedule (see .github/workflows/update-climate-data.yml).
-Can also be run manually:
-    python update_climate_data.py
+Meant to be run on a schedule (see .github/workflows/update-data.yml),
+once per region. Can also be run manually:
+    python update_climate_data.py --region congo
+    python update_climate_data.py --region algeria
 
 IMPORTANT — inherent limitation, not a bug:
 NASA POWER's near-real-time data has a ~3-5 day processing lag. Running
@@ -18,8 +19,13 @@ this script daily will NOT make today's data appear today — it just keeps
 the file moving forward automatically instead of staying frozen at a
 single old date. The most recent 3-5 days will always show as unavailable
 until NASA POWER finishes processing them, no matter how often this runs.
+
+Adding a region: this script needs no changes — it reads whichever CSV
+path regions.py's REGIONS[<id>]["climate_csv"] points to, and re-derives
+the grid points from whatever (LAT, LON) pairs are already in that file.
 """
 
+import argparse
 import sys
 import time
 from datetime import date, timedelta
@@ -27,7 +33,7 @@ from datetime import date, timedelta
 import pandas as pd
 import requests
 
-CLIMATE_CSV = "phoenix_climate_2020_2026.csv"
+import regions as region_config
 
 # How many days back to re-fetch each run. Wider than the ~3-5 day lag so
 # that rows which were "-999" last time get a chance to be filled in once
@@ -37,7 +43,9 @@ LOOKBACK_DAYS = 10
 # NASA POWER community — must match whatever produced the original CSV, or
 # values may not line up with the historical data. "RE" (Renewable Energy)
 # is the common choice for this parameter set; check power.larc.nasa.gov
-# docs and adjust if the numbers look inconsistent with older rows.
+# docs and adjust per-region below if a region's numbers look inconsistent
+# with its own historical data (e.g. if Algeria's file was built with a
+# different community setting than Congo's).
 COMMUNITY = "RE"
 
 PARAMETERS = "T2M_MAX,T2M_MIN,RH2M,WS2M,WD2M,PRECTOTCORR"
@@ -91,9 +99,13 @@ def fetch_point(lat: float, lon: float, start: date, end: date) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main():
-    print(f"Loading existing data from {CLIMATE_CSV} ...")
-    existing = pd.read_csv(CLIMATE_CSV)
+def update_region(region_id: str):
+    cfg = region_config.get_region(region_id)
+    climate_csv = cfg["climate_csv"]
+
+    print(f"=== Region: {cfg['flag']} {cfg['label']} ({climate_csv}) ===")
+    print(f"Loading existing data from {climate_csv} ...")
+    existing = pd.read_csv(climate_csv)
     existing["YEAR"] = existing["YEAR"].astype(int)
     existing["DOY"] = existing["DOY"].astype(int)
 
@@ -129,11 +141,23 @@ def main():
     kept = existing[~existing_keys.isin(fresh_keys)]
 
     merged = pd.concat([kept, fresh], ignore_index=True)
+    # Preserve any extra engineered columns already in the file (e.g.
+    # Algeria's temp_avg_7d / rain_sum_30d / season) for rows we kept —
+    # freshly-fetched rows simply won't have those columns populated,
+    # which is fine: the app only actually needs the core weather columns.
     merged = merged.sort_values(["YEAR", "DOY", "LAT", "LON"]).reset_index(drop=True)
 
-    merged.to_csv(CLIMATE_CSV, index=False)
-    print(f"Saved {len(merged)} total rows to {CLIMATE_CSV} "
+    merged.to_csv(climate_csv, index=False)
+    print(f"Saved {len(merged)} total rows to {climate_csv} "
           f"({len(existing)} before -> {len(merged)} after).")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--region", required=True, choices=list(region_config.REGIONS.keys()),
+                         help="Which region's climate file to refresh.")
+    args = parser.parse_args()
+    update_region(args.region)
 
 
 if __name__ == "__main__":
