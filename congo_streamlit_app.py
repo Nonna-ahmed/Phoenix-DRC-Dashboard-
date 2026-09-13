@@ -53,7 +53,7 @@ def predict_fire_risk_for_region(region_id: str, **kwargs) -> dict:
 # every call below now forwards ?region=... so the API loads the right
 # climate/shelters/model files.
 # -------------------------------------------------------------
-API_BASE_URL = "https://phoenix-drc-dashboard-production.up.railway.app"
+API_BASE_URL = "https://phoenix-drc-api-production.up.railway.app"
 
 @st.cache_data(ttl=300)
 def fetch_risk_map_future(target_date: str, region_id: str):
@@ -448,7 +448,7 @@ def generate_demo_voice_audio(text: str, lang: str = "en"):
     don't treat it as guaranteed production infrastructure."""
     try:
         from gtts import gTTS
-        gtts_lang = {"en": "en", "fr": "fr", "sw": "sw"}.get(lang, "en")
+        gtts_lang = {"en": "en", "fr": "fr", "sw": "sw", "ar": "ar"}.get(lang, "en")
         tts = gTTS(text=text, lang=gtts_lang)
         buf = io.BytesIO()
         tts.write_to_fp(buf)
