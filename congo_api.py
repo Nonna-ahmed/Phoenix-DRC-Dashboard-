@@ -69,6 +69,7 @@ from pydantic import BaseModel, Field
 
 from risk_engine import get_alert
 from air_quality import fetch_live_pm25
+import regions as region_config
 
 # -----------------------------------------------------------------
 # Predictor — use congo_predict if available, fall back to a simple
@@ -105,69 +106,128 @@ def dummy_predict_fire_risk(**kwargs) -> dict:
     return {"fire_probability": round(prob, 4), "risk_level": level}
 
 
-def call_predict(**kwargs) -> dict:
+def call_predict(region: str = region_config.DEFAULT_REGION, **kwargs) -> dict:
     """Single entry point for fire-risk prediction used across every
-    endpoint — uses congo_predict when available, otherwise the fallback."""
-    if HAS_CONGO_PREDICT and predict_fire_risk is not None:
-        return predict_fire_risk(**kwargs)
-    return dummy_predict_fire_risk(**kwargs)
+    endpoint. Routes by region:
+      - "congo" (or any region flagged use_congo_predict) -> the existing
+        congo_predict.py, completely unchanged, so Congo's already-tested
+        behavior never shifts just because other regions were added.
+      - everything else -> the generic XGBoost predictor in regions.py,
+        which works for any region sharing the same 8-feature schema
+        (confirmed true for Algeria's model).
+      - if congo_predict.py itself is missing, falls back to the dummy
+        rule-based score exactly as before (region-independent safety net)."""
+    cfg = region_config.get_region(region)
+    if cfg.get("use_congo_predict", region == "congo"):
+        if HAS_CONGO_PREDICT and predict_fire_risk is not None:
+            return predict_fire_risk(**kwargs)
+        return dummy_predict_fire_risk(**kwargs)
+    return region_config.predict_fire_risk_generic(region, **kwargs)
 
 
 # -----------------------------------------------------------------
 # App
 # -----------------------------------------------------------------
 app = FastAPI(
-    title="Congo API — PHOENIX (Katanga)",
-    description="Wildfire early-warning, forecast & shelter-matching API for "
-                "Haut-Katanga, Lualaba & Tanganyika (DRC)",
-    version="2.0.0",
+    title="Congo API — PHOENIX (multi-region)",
+    description="Wildfire early-warning, forecast & shelter-matching API — "
+                "currently covering Congo (Katanga) and northern Algeria. "
+                "Every endpoint takes an optional ?region=congo|algeria "
+                "query param (defaults to congo for backward compatibility).",
+    version="3.0.0",
 )
 
 # -----------------------------------------------------------------
-# Data loading
+# Data loading — PER REGION, cached on first use.
+#
+# Each region gets its own climate DataFrame, "latest available date",
+# shelters DataFrame, and ClimatologyEngine, keyed by region id. Nothing
+# is loaded at import time anymore (unlike the old single-region version)
+# — a region's files are only read from disk the first time that region
+# is actually requested, so adding a region to regions.py never risks
+# breaking startup for regions whose files exist and work fine.
 # -----------------------------------------------------------------
-CLIMATE_CSV = "phoenix_climate_2020_2026.csv"
-if not os.path.exists(CLIMATE_CSV):
-    raise FileNotFoundError(
-        f"Climate file not found: {CLIMATE_CSV}. Place it next to this script."
-    )
-
-CLIMATE_DF = pd.read_csv(CLIMATE_CSV)
-CLIMATE_DF = CLIMATE_DF.dropna(subset=["YEAR", "DOY"])  # a few rows have genuinely missing YEAR/DOY
-CLIMATE_DF["YEAR"] = CLIMATE_DF["YEAR"].astype(int)
-CLIMATE_DF["DOY"] = CLIMATE_DF["DOY"].astype(int)
-CLIMATE_DF["date"] = pd.to_datetime(CLIMATE_DF["YEAR"].astype(str), format="%Y") + \
-                      pd.to_timedelta(CLIMATE_DF["DOY"] - 1, unit="D")
-
-# NASA POWER has a ~3-5 day processing lag; unprocessed recent days come back
-# as the fill value -999 instead of real numbers. Mark those as NaN (don't
-# drop the row) so the date itself still counts as "available" — /risk-map
-# reports "No data" for the specific points that are missing, and the
-# climatology engine's averages simply ignore NaN automatically.
 _weather_cols = ["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
-CLIMATE_DF[_weather_cols] = CLIMATE_DF[_weather_cols].where(CLIMATE_DF[_weather_cols] >= -900)
 
-# Latest date with FULL grid coverage — no NaN for any point. Newer dates
-# may exist in the data but can still have partial "No data" from NASA
-# POWER's processing lag; /risk-map still reports those individually, but
-# LATEST_AVAILABLE_DATE (used as the "current" reference date by /alerts,
-# USSD forecast fallback, etc.) is the most recent FULLY clean date.
-_total_cells = CLIMATE_DF[["LAT", "LON"]].drop_duplicates().shape[0]
-_complete_counts = CLIMATE_DF.dropna(subset=_weather_cols).groupby("date").size()
-_full_coverage_dates = _complete_counts[_complete_counts == _total_cells]
-LATEST_AVAILABLE_DATE = (_full_coverage_dates.index.max() if not _full_coverage_dates.empty
-                          else CLIMATE_DF["date"].max()).normalize()
+_CLIMATE_CACHE: dict = {}
+_LATEST_DATE_CACHE: dict = {}
+_SHELTERS_CACHE: dict = {}
+_CLIM_ENGINE_CACHE: dict = {}
 
-SHELTERS_DF = pd.read_csv("drc_katanga_shelters_final.csv")
-SHELTERS_DF = SHELTERS_DF.rename(columns={"capacity_estimate": "capacity"})
-if "available" not in SHELTERS_DF.columns:
-    SHELTERS_DF["available"] = SHELTERS_DF["capacity"]
-# Accessibility info for elderly/disabled evacuees — genuinely unknown
-# until shelter staff report it via PATCH /shelters/{osm_id}/availability,
-# never invented or assumed.
-for _col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
-    if _col not in SHELTERS_DF.columns:
-        SHELTERS_DF[_col] = None
+
+def _load_climate_for_region(region: str) -> pd.DataFrame:
+    cfg = region_config.get_region(region)
+    csv_path = cfg["climate_csv"]
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Climate file not found for region '{region}': {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    df = df.dropna(subset=["YEAR", "DOY"])  # a few rows have genuinely missing YEAR/DOY
+    df["YEAR"] = df["YEAR"].astype(int)
+    df["DOY"] = df["DOY"].astype(int)
+    df["date"] = pd.to_datetime(df["YEAR"].astype(str), format="%Y") + \
+                 pd.to_timedelta(df["DOY"] - 1, unit="D")
+
+    # NASA POWER has a ~3-5 day processing lag; unprocessed recent days come
+    # back as the fill value -999 instead of real numbers. Mark those as NaN
+    # (don't drop the row) so the date itself still counts as "available" —
+    # /risk-map reports "No data" for the specific points that are missing.
+    df[_weather_cols] = df[_weather_cols].where(df[_weather_cols] >= -900)
+
+    # Latest date with FULL grid coverage for this region.
+    total_cells = df[["LAT", "LON"]].drop_duplicates().shape[0]
+    complete_counts = df.dropna(subset=_weather_cols).groupby("date").size()
+    full_coverage_dates = complete_counts[complete_counts == total_cells]
+    latest = (full_coverage_dates.index.max() if not full_coverage_dates.empty
+              else df["date"].max()).normalize()
+
+    _CLIMATE_CACHE[region] = df
+    _LATEST_DATE_CACHE[region] = latest
+    return df
+
+
+def get_climate_df(region: str) -> pd.DataFrame:
+    if region not in _CLIMATE_CACHE:
+        _load_climate_for_region(region)
+    return _CLIMATE_CACHE[region]
+
+
+def get_latest_available_date(region: str) -> pd.Timestamp:
+    if region not in _LATEST_DATE_CACHE:
+        _load_climate_for_region(region)
+    return _LATEST_DATE_CACHE[region]
+
+
+def get_shelters_df(region: str) -> pd.DataFrame:
+    if region not in _SHELTERS_CACHE:
+        cfg = region_config.get_region(region)
+        df = pd.read_csv(cfg["shelters_csv"])
+        # No-op for files that already use "capacity" (e.g. Algeria's
+        # already-prepped file) — rename() silently ignores columns that
+        # aren't present, so this stays safe for every region.
+        df = df.rename(columns={"capacity_estimate": "capacity"})
+        if "available" not in df.columns:
+            df["available"] = df["capacity"]
+        # Accessibility info for elderly/disabled evacuees — genuinely
+        # unknown until shelter staff report it via
+        # PATCH /shelters/{osm_id}/availability, never invented or assumed.
+        for col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
+            if col not in df.columns:
+                df[col] = None
+        _SHELTERS_CACHE[region] = df
+    return _SHELTERS_CACHE[region]
+
+
+def set_shelters_df(region: str, df: pd.DataFrame):
+    """Used by PATCH /shelters/{osm_id}/availability to write back the
+    updated DataFrame into the per-region cache."""
+    _SHELTERS_CACHE[region] = df
+
+
+def get_clim_engine(region: str) -> "ClimatologyEngine":
+    if region not in _CLIM_ENGINE_CACHE:
+        _CLIM_ENGINE_CACHE[region] = ClimatologyEngine(get_climate_df(region))
+    return _CLIM_ENGINE_CACHE[region]
 
 # -----------------------------------------------------------------
 # Citizen fire reports (crowd-sourced via USSD) — stored as a local CSV.
@@ -177,7 +237,7 @@ for _col in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
 # for a proper database (e.g. a small Postgres add-on) or a Google Sheet.
 # -----------------------------------------------------------------
 FIRE_REPORTS_CSV = "citizen_fire_reports.csv"
-_FIRE_REPORT_COLUMNS = ["report_id", "province", "lat", "lon", "phone_number", "reported_at_utc"]
+_FIRE_REPORT_COLUMNS = ["report_id", "region", "province", "lat", "lon", "phone_number", "reported_at_utc"]
 FIRE_REPORT_COOLDOWN_MINUTES = 60  # basic anti-spam: one report per phone number per hour
 
 
@@ -191,18 +251,26 @@ class FireReportCooldownError(Exception):
 
 def _load_fire_reports() -> pd.DataFrame:
     if os.path.exists(FIRE_REPORTS_CSV):
-        return pd.read_csv(FIRE_REPORTS_CSV)
+        df = pd.read_csv(FIRE_REPORTS_CSV)
+        # Reports saved before multi-region support won't have a "region"
+        # column — treat those as "congo" (this API's original single
+        # region) rather than dropping/breaking on old data.
+        if "region" not in df.columns:
+            df["region"] = region_config.DEFAULT_REGION
+        return df
     return pd.DataFrame(columns=_FIRE_REPORT_COLUMNS)
 
 
-def _save_fire_report(province: str, lat: float, lon: float, phone_number: str) -> int:
+def _save_fire_report(region: str, province: str, lat: float, lon: float, phone_number: str) -> int:
     df = _load_fire_reports()
 
     # Anti-spam: block a new report from the same phone number within the
     # cooldown window. Only enforced when we actually have a phone number
-    # (USSD always provides one; direct API calls might not).
+    # (USSD always provides one; direct API calls might not). Scoped to the
+    # SAME region too — a phone number legitimately reporting once in Congo
+    # and once in Algeria isn't spam.
     if phone_number and not df.empty:
-        same_caller = df[df["phone_number"].astype(str) == str(phone_number)]
+        same_caller = df[(df["phone_number"].astype(str) == str(phone_number)) & (df["region"] == region)]
         if not same_caller.empty:
             last_report_time = pd.to_datetime(same_caller["reported_at_utc"]).max()
             elapsed = pd.Timestamp.utcnow().tz_localize(None) - last_report_time
@@ -212,7 +280,7 @@ def _save_fire_report(province: str, lat: float, lon: float, phone_number: str) 
 
     report_id = int(df["report_id"].max()) + 1 if not df.empty else 1
     new_row = pd.DataFrame([{
-        "report_id": report_id, "province": province, "lat": lat, "lon": lon,
+        "report_id": report_id, "region": region, "province": province, "lat": lat, "lon": lon,
         "phone_number": phone_number,
         "reported_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }])
@@ -234,20 +302,23 @@ def haversine_km(lat1, lon1, lat2, lon2):
 # Same ephemeral-storage caveat as fire reports.
 # -----------------------------------------------------------------
 ASSISTANCE_REQUESTS_CSV = "assistance_requests.csv"
-_ASSISTANCE_COLUMNS = ["request_id", "province", "lat", "lon", "phone_number", "requested_at_utc"]
+_ASSISTANCE_COLUMNS = ["request_id", "region", "province", "lat", "lon", "phone_number", "requested_at_utc"]
 ASSISTANCE_COOLDOWN_MINUTES = 10  # short — a genuine urgent need shouldn't be blocked for long
 
 
 def _load_assistance_requests() -> pd.DataFrame:
     if os.path.exists(ASSISTANCE_REQUESTS_CSV):
-        return pd.read_csv(ASSISTANCE_REQUESTS_CSV)
+        df = pd.read_csv(ASSISTANCE_REQUESTS_CSV)
+        if "region" not in df.columns:
+            df["region"] = region_config.DEFAULT_REGION
+        return df
     return pd.DataFrame(columns=_ASSISTANCE_COLUMNS)
 
 
-def _save_assistance_request(province: str, lat: float, lon: float, phone_number: str) -> int:
+def _save_assistance_request(region: str, province: str, lat: float, lon: float, phone_number: str) -> int:
     df = _load_assistance_requests()
     if phone_number and not df.empty:
-        same_caller = df[df["phone_number"].astype(str) == str(phone_number)]
+        same_caller = df[(df["phone_number"].astype(str) == str(phone_number)) & (df["region"] == region)]
         if not same_caller.empty:
             last_time = pd.to_datetime(same_caller["requested_at_utc"]).max()
             elapsed = pd.Timestamp.utcnow().tz_localize(None) - last_time
@@ -257,7 +328,7 @@ def _save_assistance_request(province: str, lat: float, lon: float, phone_number
 
     request_id = int(df["request_id"].max()) + 1 if not df.empty else 1
     new_row = pd.DataFrame([{
-        "request_id": request_id, "province": province, "lat": lat, "lon": lon,
+        "request_id": request_id, "region": region, "province": province, "lat": lat, "lon": lon,
         "phone_number": phone_number,
         "requested_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }])
@@ -266,15 +337,11 @@ def _save_assistance_request(province: str, lat: float, lon: float, phone_number
     return request_id
 
 
-# Reference point per province, used by the USSD menu to give a quick
+# Reference points per province, used by the USSD menu to give a quick
 # forecast + nearest-shelter summary without needing the caller's GPS
-# location (basic phones on USSD have none). Same towns used as reference
-# points in the Streamlit dashboard's "Nearest Shelters" panel.
-PROVINCE_REF_POINTS = {
-    "Haut-Katanga": (-11.6609, 27.4794),   # Lubumbashi
-    "Lualaba": (-10.7167, 25.4667),        # Kolwezi
-    "Tanganyika": (-5.9475, 29.1947),      # Kalemie
-}
+# location (basic phones on USSD have none). Now sourced per-region from
+# regions.py (region_config.get_region(region)["province_ref_points"])
+# instead of a single hardcoded Congo dict, so USSD works for any region.
 
 
 # -----------------------------------------------------------------
@@ -329,7 +396,9 @@ class ClimatologyEngine:
         }
 
 
-CLIM_ENGINE = ClimatologyEngine(CLIMATE_DF)
+# Per-region ClimatologyEngine instances are created lazily by
+# get_clim_engine(region), defined earlier alongside the other per-region
+# caches — no single global engine anymore.
 
 
 # -----------------------------------------------------------------
@@ -343,21 +412,78 @@ CLIM_ENGINE = ClimatologyEngine(CLIMATE_DF)
 # 404s on a deployed server, it's because this route/function block
 # isn't present in the deployed copy of this file yet — not a missing
 # pip package.
-# -----------------------------------------------------------------
-# APPROXIMATIONS made for this near-equatorial region (Katanga, DRC):
-#   - The FWI System's day-length factors (Le for DMC, Lf for DC) are
-#     normally looked up per calendar month from a table tuned for Canadian
-#     latitudes, where day length varies a lot across the year. Near the
-#     equator, day length is close to constant (~11.5-12.5h) year-round, so
-#     month-specific factors barely matter — we use fixed near-equatorial
-#     constants instead of Canada's table.
+#
+# DAY-LENGTH ADJUSTMENT — GENERALIZED FOR ANY LATITUDE:
+#   The DMC and DC codes both depend on a day-length adjustment factor
+#   (Le for DMC, Lf for DC) that normally varies by calendar month AND by
+#   latitude — day length swings a lot across the year at high latitudes
+#   (Canada), barely at all near the equator. An earlier version of this
+#   function used a single fixed near-equatorial constant, which was a
+#   reasonable shortcut for Congo/Katanga alone but wrong for any region
+#   far from the equator (e.g. northern Algeria at ~36N, where day length
+#   genuinely varies by season).
+#
+#   day_length_factors() below replaces that with the full latitude-banded
+#   monthly lookup tables, exactly as documented in Lawson & Armitage
+#   (2008), "Weather Guide for the Canadian Forest Fire Danger Rating
+#   System" (Natural Resources Canada), and implemented identically in the
+#   official `cffdrs` R package used by Canadian fire agencies. This makes
+#   the SAME compute_fwi() correct for every region — equatorial, temperate,
+#   Southern Hemisphere — with no per-region constant to hand-tune when a
+#   new region gets added later.
+#
+# OTHER APPROXIMATIONS (unchanged, and not latitude-specific):
 #   - "Noon temperature" is approximated using the daily T2M_MAX, since
 #     NASA POWER provides daily max/min rather than hourly readings — a
 #     common substitution when only daily data is available.
 #   - Wind speed is converted from NASA POWER's m/s to the km/h the FWI
 #     System's equations expect.
-_FWI_LE_EQUATOR = 9.0   # DMC effective day-length factor, near-equatorial
-_FWI_LF_EQUATOR = 1.4   # DC day-length factor, near-equatorial
+# -----------------------------------------------------------------
+_DMC_LE_BY_MONTH = {
+    # lat >= 30N — the original Canadian standard table (Van Wagner 1987)
+    "north_temperate": [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0],
+    # 10N <= lat < 30N
+    "north_subtropic": [7.9, 8.4, 8.9, 9.5, 9.9, 10.2, 10.1, 9.7, 9.1, 8.6, 8.1, 7.8],
+    # -30N <= lat < -10N (i.e. 10S-30S)
+    "south_subtropic": [10.1, 9.6, 9.1, 8.5, 8.1, 7.8, 7.9, 8.3, 8.9, 9.4, 9.9, 10.2],
+    # lat < -30 (south of 30S)
+    "south_temperate": [11.5, 10.5, 9.2, 7.9, 6.8, 6.2, 6.5, 7.4, 8.7, 10.0, 11.2, 11.8],
+}
+_DC_LF_BY_MONTH = {
+    "north": [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6],  # lat > 20N
+    "south": [6.4, 5.0, 2.4, 0.4, -1.6, -1.6, -1.6, -1.6, -1.6, 0.9, 3.8, 5.8],  # lat < -20 (south of 20S)
+}
+_DMC_LE_EQUATOR = 9.0   # -10 <= lat <= 10: day length barely varies near the equator, constant all year
+_DC_LF_EQUATOR = 1.4    # -20 <= lat <= 20: same reasoning, wider band for DC specifically
+
+
+def day_length_factors(lat: float, month: int):
+    """Returns (Le, Lf) — the DMC and DC day-length adjustment factors for
+    this latitude and calendar month (1-12) — using the standard
+    latitude-banded tables described above instead of a single fixed
+    constant. Works correctly for any latitude, either hemisphere."""
+    m = month - 1  # 0-indexed into the monthly tables
+
+    if lat >= 30:
+        le = _DMC_LE_BY_MONTH["north_temperate"][m]
+    elif lat >= 10:
+        le = _DMC_LE_BY_MONTH["north_subtropic"][m]
+    elif lat >= -10:
+        le = _DMC_LE_EQUATOR
+    elif lat >= -30:
+        le = _DMC_LE_BY_MONTH["south_subtropic"][m]
+    else:
+        le = _DMC_LE_BY_MONTH["south_temperate"][m]
+
+    if lat > 20:
+        lf = _DC_LF_BY_MONTH["north"][m]
+    elif lat < -20:
+        lf = _DC_LF_BY_MONTH["south"][m]
+    else:
+        lf = _DC_LF_EQUATOR
+
+    return le, lf
+
 
 _FWI_STARTUP = {"ffmc": 85.0, "dmc": 6.0, "dc": 15.0}  # standard Van Wagner (1987) spring startup values
 
@@ -376,20 +502,27 @@ def _fwi_danger_class(fwi_value: float) -> str:
     return "Extreme"
 
 
-def compute_fwi(lat: float, lon: float):
+def compute_fwi(region: str, lat: float, lon: float):
     """Runs the full Canadian FWI System recursively over EVERY day of
-    weather on record for the nearest grid cell (each day's fuel moisture
-    codes depend on the previous day's — this is inherent to the FWI
-    System, not something we can skip), and returns the final day's
-    component values. Returns None if there's no usable weather data for
-    that location."""
-    grid_points = CLIMATE_DF[["LAT", "LON"]].drop_duplicates()
+    weather on record for the nearest grid cell IN THE GIVEN REGION (each
+    day's fuel moisture codes depend on the previous day's — this is
+    inherent to the FWI System, not something we can skip), and returns
+    the final day's component values. Returns None if there's no usable
+    weather data for that location.
+
+    Day-length factors (Le for DMC, Lf for DC) are looked up per day from
+    day_length_factors(), keyed by this grid cell's actual latitude and
+    each day's calendar month — so this same function is correct whether
+    the nearest grid cell sits near the equator (Katanga) or at temperate
+    latitudes (northern Algeria), with no region-specific constant."""
+    climate_df = get_climate_df(region)
+    grid_points = climate_df[["LAT", "LON"]].drop_duplicates()
     if grid_points.empty:
         return None
     dists = ((grid_points["LAT"] - lat) ** 2 + (grid_points["LON"] - lon) ** 2) ** 0.5
     g_lat, g_lon = grid_points.loc[dists.idxmin(), ["LAT", "LON"]]
 
-    series = CLIMATE_DF[(CLIMATE_DF["LAT"] == g_lat) & (CLIMATE_DF["LON"] == g_lon)].sort_values("date")
+    series = climate_df[(climate_df["LAT"] == g_lat) & (climate_df["LON"] == g_lon)].sort_values("date")
     series = series.dropna(subset=["T2M_MAX", "RH2M", "WS2M", "PRECTOTCORR"])
     if series.empty:
         return None
@@ -402,6 +535,11 @@ def compute_fwi(lat: float, lon: float):
         RH = min(max(float(row["RH2M"]), 0.0), 100.0)
         W = float(row["WS2M"]) * 3.6  # m/s -> km/h
         H = max(float(row["PRECTOTCORR"]), 0.0)
+        # Day-length factors for THIS grid cell's latitude and THIS day's
+        # calendar month — varies day to day for latitudes far from the
+        # equator (e.g. northern Algeria), constant year-round near the
+        # equator (e.g. Katanga) — both handled correctly by the same call.
+        le, lf = day_length_factors(float(g_lat), row["date"].month)
 
         # --- FFMC (Fine Fuel Moisture Code) ---
         mo = 147.2 * (101 - ffmc) / (59.5 + ffmc)
@@ -446,7 +584,7 @@ def compute_fwi(lat: float, lon: float):
             # ValueError ("math domain error") crash the whole endpoint.
             mr_dmc = max(mr_dmc, 20.0001)
             dmc = max(244.72 - 43.43 * log(mr_dmc - 20), 0.0)
-        k = 1.894 * (Tc + 1.1) * (100 - RH) * _FWI_LE_EQUATOR * 1e-6
+        k = 1.894 * (Tc + 1.1) * (100 - RH) * le * 1e-6
         dmc = dmc + 100 * k
 
         # --- DC (Drought Code) ---
@@ -458,7 +596,7 @@ def compute_fwi(lat: float, lon: float):
             # Guard: Qr must stay positive for log(800 / Qr) to be valid.
             Qr = max(Qr, 0.0001)
             dc = max(400 * log(800 / Qr), 0.0)
-        V = max(0.36 * (Tc2 + 2.8) + _FWI_LF_EQUATOR, 0.0)
+        V = max(0.36 * (Tc2 + 2.8) + lf, 0.0)
         dc = dc + 0.5 * V
 
         last_date, last_wind_kmh = row["date"], W
@@ -554,7 +692,8 @@ class AlertOut(BaseModel):
 # Request / response schemas — citizen fire reports & shelter updates
 # -----------------------------------------------------------------
 class FireReportRequest(BaseModel):
-    province: str = Field(..., description="Haut-Katanga, Lualaba, or Tanganyika")
+    region: str = Field(region_config.DEFAULT_REGION, description="congo or algeria")
+    province: str = Field(..., description="Province/wilaya name — must match the chosen region's list")
     lat: float = Field(..., json_schema_extra={"example": -11.66})
     lon: float = Field(..., json_schema_extra={"example": 27.48})
     phone_number: Optional[str] = Field(None, description="Reporter's phone number, if available")
@@ -562,6 +701,7 @@ class FireReportRequest(BaseModel):
 
 class FireReportOut(BaseModel):
     report_id: int
+    region: str
     province: str
     lat: float
     lon: float
@@ -570,7 +710,8 @@ class FireReportOut(BaseModel):
 
 
 class AssistanceRequestIn(BaseModel):
-    province: str = Field(..., description="Haut-Katanga, Lualaba, or Tanganyika")
+    region: str = Field(region_config.DEFAULT_REGION, description="congo or algeria")
+    province: str = Field(..., description="Province/wilaya name — must match the chosen region's list")
     lat: float = Field(..., json_schema_extra={"example": -11.66})
     lon: float = Field(..., json_schema_extra={"example": 27.48})
     phone_number: Optional[str] = Field(None, description="Requester's phone number, if available")
@@ -578,6 +719,7 @@ class AssistanceRequestIn(BaseModel):
 
 class AssistanceRequestOut(BaseModel):
     request_id: int
+    region: str
     province: str
     lat: float
     lon: float
@@ -596,6 +738,7 @@ class ShelterAvailabilityRequest(BaseModel):
 # Request / response schemas — future forecast
 # -----------------------------------------------------------------
 class PredictFutureRequest(BaseModel):
+    region: str = Field(region_config.DEFAULT_REGION, description="congo or algeria")
     lat: float = Field(..., json_schema_extra={"example": -9.9})
     lon: float = Field(..., json_schema_extra={"example": 27.5})
     date: str = Field(..., description="Future date YYYY-MM-DD, e.g. 2026-09-15")
@@ -627,6 +770,7 @@ class RiskMapFutureResponse(BaseModel):
 
 
 class ForecastLiveRequest(BaseModel):
+    region: str = Field(region_config.DEFAULT_REGION, description="congo or algeria")
     lat: float = Field(..., json_schema_extra={"example": -9.9})
     lon: float = Field(..., json_schema_extra={"example": 27.5})
     date: str = Field(..., description="Future date YYYY-MM-DD")
@@ -653,34 +797,40 @@ class ForecastLiveResponse(BaseModel):
 def health():
     return {
         "status": "ok",
-        "service": "Congo API — PHOENIX (Katanga)",
-        "version": "2.0.0",
-        "predictor": "congo_predict" if HAS_CONGO_PREDICT else "dummy_fallback",
+        "service": "Congo API — PHOENIX (multi-region)",
+        "version": "3.0.0",
+        "regions": list(region_config.REGIONS.keys()),
+        "predictor": "congo_predict (congo) + generic XGBoost (other regions)" if HAS_CONGO_PREDICT else "dummy_fallback",
     }
 
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+def predict(req: PredictRequest, region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria")):
     return call_predict(
-        lat=req.lat, lon=req.lon, doy=req.doy,
+        region=region, lat=req.lat, lon=req.lon, doy=req.doy,
         t2m_max=req.t2m_max, t2m_min=req.t2m_min,
         rh2m=req.rh2m, ws2m=req.ws2m, prectotcorr=req.prectotcorr,
     )
 
 
 @app.get("/risk-map", response_model=List[dict])
-def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12")):
+def risk_map(
+    date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12"),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
+):
     """Fire risk for every grid cell using RECORDED weather. Health/AQI
-    fields populate for any date within the last year of LATEST_AVAILABLE_DATE
-    — Open-Meteo only ever returns the CURRENT live reading, never historical
-    air quality for the selected date, so this is always "right now", just
-    made available while browsing recent history rather than only on the
-    single most-recent date."""
-    day_data = CLIMATE_DF[CLIMATE_DF["date"] == pd.Timestamp(date)]
+    fields populate for any date within the last year of this region's
+    latest available date — Open-Meteo only ever returns the CURRENT live
+    reading, never historical air quality for the selected date, so this
+    is always "right now", just made available while browsing recent
+    history rather than only on the single most-recent date."""
+    climate_df = get_climate_df(region)
+    latest_available_date = get_latest_available_date(region)
+    day_data = climate_df[climate_df["date"] == pd.Timestamp(date)]
     if day_data.empty:
         raise HTTPException(status_code=404, detail="No climate data available for this date.")
 
-    days_from_latest = (LATEST_AVAILABLE_DATE - pd.Timestamp(date).normalize()).days
+    days_from_latest = (latest_available_date - pd.Timestamp(date).normalize()).days
     show_live_aq = 0 <= days_from_latest <= 365
     doy = pd.Timestamp(date).dayofyear
     results = []
@@ -693,7 +843,7 @@ def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 20
             })
             continue
         r = call_predict(
-            lat=row["LAT"], lon=row["LON"], doy=doy,
+            region=region, lat=row["LAT"], lon=row["LON"], doy=doy,
             t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
             rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
         )
@@ -711,11 +861,13 @@ def risk_map(date: date_type = Query(..., description="Date to evaluate, e.g. 20
 
 @app.get("/shelters", response_model=List[ShelterOut])
 def list_shelters(
-    category: Optional[str] = Query(None, description="school, place_of_worship, or health_facility"),
-    province: Optional[str] = Query(None, description="Haut-Katanga, Lualaba, or Tanganyika"),
-    only_shelters: bool = Query(False, description="If true, exclude health facilities (support-only)"),
+    category: Optional[str] = Query(None, description="school, place_of_worship, health_facility, "
+                                                        "fire_station, or emergency_shelter"),
+    province: Optional[str] = Query(None, description="Province/wilaya name — depends on region"),
+    only_shelters: bool = Query(False, description="If true, exclude support-only facilities"),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
 ):
-    df = SHELTERS_DF
+    df = get_shelters_df(region)
     if category:
         df = df[df["category"] == category]
     if province:
@@ -732,9 +884,11 @@ def list_shelters(
 def nearest_shelter(
     lat: float = Query(..., json_schema_extra={"example": -9.9}),
     lon: float = Query(..., json_schema_extra={"example": 27.5}),
-    only_shelters: bool = Query(True, description="Restrict to real shelters (exclude health facilities)"),
+    only_shelters: bool = Query(True, description="Restrict to real shelters (exclude support-only facilities)"),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
 ):
-    df = SHELTERS_DF[SHELTERS_DF["available"] > 0].copy()
+    df = get_shelters_df(region)
+    df = df[df["available"] > 0].copy()
     if only_shelters:
         df = df[df["is_shelter"]]
     if df.empty:
@@ -750,11 +904,15 @@ def nearest_shelter(
 
 
 @app.get("/alerts", response_model=List[AlertOut])
-def alerts(date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12")):
-    zones = risk_map(date)
+def alerts(
+    date: date_type = Query(..., description="Date to evaluate, e.g. 2026-08-12"),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
+):
+    zones = risk_map(date, region)
     high_risk = [z for z in zones if z["risk_level"] == "High"]
 
-    shelters = SHELTERS_DF[(SHELTERS_DF["is_shelter"]) & (SHELTERS_DF["available"] > 0)].copy()
+    shelters_df = get_shelters_df(region)
+    shelters = shelters_df[(shelters_df["is_shelter"]) & (shelters_df["available"] > 0)].copy()
 
     out = []
     for z in high_risk:
@@ -789,27 +947,35 @@ def submit_fire_report(req: FireReportRequest):
     """Records a citizen-submitted fire sighting (from USSD or the API
     directly). Helps cover the ~3-5 day gap in NASA POWER's own processing
     lag with real-time, on-the-ground reports. Rate-limited to one report
-    per phone number per hour to reduce fake/spam reports."""
-    if req.province not in PROVINCE_REF_POINTS:
-        raise HTTPException(status_code=400, detail=f"province must be one of {list(PROVINCE_REF_POINTS)}")
+    per phone number per hour (per region) to reduce fake/spam reports."""
+    region_cfg = region_config.get_region(req.region)  # raises ValueError -> caught by FastAPI as 500;
+    # kept simple since an invalid region is a programmer error, not a user one
+    if req.province not in region_cfg["province_ref_points"]:
+        raise HTTPException(status_code=400,
+                             detail=f"province must be one of {list(region_cfg['province_ref_points'])} for region '{req.region}'")
     try:
-        report_id = _save_fire_report(req.province, req.lat, req.lon, req.phone_number)
+        report_id = _save_fire_report(req.region, req.province, req.lat, req.lon, req.phone_number)
     except FireReportCooldownError as e:
         raise HTTPException(status_code=429, detail=str(e))
     return {
-        "report_id": report_id, "province": req.province, "lat": req.lat, "lon": req.lon,
-        "phone_number": req.phone_number,
+        "report_id": report_id, "region": req.region, "province": req.province,
+        "lat": req.lat, "lon": req.lon, "phone_number": req.phone_number,
         "reported_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 @app.get("/fire-reports", response_model=List[FireReportOut])
-def list_fire_reports(hours: int = Query(72, description="Only reports from the last N hours")):
+def list_fire_reports(
+    hours: int = Query(72, description="Only reports from the last N hours"),
+    region: Optional[str] = Query(None, description="Filter to one region; omit for all regions"),
+):
     """Lists recent citizen fire reports, newest first. Defaults to the
     last 72 hours so old reports don't linger on the map forever."""
     df = _load_fire_reports()
     if df.empty:
         return []
+    if region:
+        df = df[df["region"] == region]
     df["reported_at_utc"] = pd.to_datetime(df["reported_at_utc"])
     cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=hours)
     df = df[df["reported_at_utc"] >= cutoff].sort_values("reported_at_utc", ascending=False)
@@ -823,25 +989,32 @@ def submit_assistance_request(req: AssistanceRequestIn):
     disabled people (or someone calling on their behalf) who need help
     physically evacuating, not just a fire sighting. Surfaced separately
     from fire reports so responders can prioritize accordingly."""
-    if req.province not in PROVINCE_REF_POINTS:
-        raise HTTPException(status_code=400, detail=f"province must be one of {list(PROVINCE_REF_POINTS)}")
+    region_cfg = region_config.get_region(req.region)
+    if req.province not in region_cfg["province_ref_points"]:
+        raise HTTPException(status_code=400,
+                             detail=f"province must be one of {list(region_cfg['province_ref_points'])} for region '{req.region}'")
     try:
-        request_id = _save_assistance_request(req.province, req.lat, req.lon, req.phone_number)
+        request_id = _save_assistance_request(req.region, req.province, req.lat, req.lon, req.phone_number)
     except FireReportCooldownError as e:
         raise HTTPException(status_code=429, detail=str(e))
     return {
-        "request_id": request_id, "province": req.province, "lat": req.lat, "lon": req.lon,
-        "phone_number": req.phone_number,
+        "request_id": request_id, "region": req.region, "province": req.province,
+        "lat": req.lat, "lon": req.lon, "phone_number": req.phone_number,
         "requested_at_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 @app.get("/assistance-requests", response_model=List[AssistanceRequestOut])
-def list_assistance_requests(hours: int = Query(72, description="Only requests from the last N hours")):
+def list_assistance_requests(
+    hours: int = Query(72, description="Only requests from the last N hours"),
+    region: Optional[str] = Query(None, description="Filter to one region; omit for all regions"),
+):
     """Lists recent evacuation-assistance requests, newest first."""
     df = _load_assistance_requests()
     if df.empty:
         return []
+    if region:
+        df = df[df["region"] == region]
     df["requested_at_utc"] = pd.to_datetime(df["requested_at_utc"])
     cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=hours)
     df = df[df["requested_at_utc"] >= cutoff].sort_values("requested_at_utc", ascending=False)
@@ -850,7 +1023,10 @@ def list_assistance_requests(hours: int = Query(72, description="Only requests f
 
 
 @app.patch("/shelters/{osm_id}/availability")
-def update_shelter_availability(osm_id: str, req: ShelterAvailabilityRequest):
+def update_shelter_availability(
+    osm_id: str, req: ShelterAvailabilityRequest,
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
+):
     """Lets shelter staff update how many spots are currently open, and
     optionally report accessibility info (wheelchair access, ground floor,
     medical staff on-site) for elderly/disabled evacuees — only set fields
@@ -858,17 +1034,18 @@ def update_shelter_availability(osm_id: str, req: ShelterAvailabilityRequest):
     reset to "no" by omission). Changes persist for the life of this
     running instance (see the ephemeral-storage note on FIRE_REPORTS_CSV
     above — same caveat applies here)."""
-    global SHELTERS_DF
-    match = SHELTERS_DF["osm_id"].astype(str) == str(osm_id)
+    shelters_df = get_shelters_df(region)
+    match = shelters_df["osm_id"].astype(str) == str(osm_id)
     if not match.any():
-        raise HTTPException(status_code=404, detail=f"No shelter with osm_id={osm_id}")
-    SHELTERS_DF.loc[match, "available"] = req.available
+        raise HTTPException(status_code=404, detail=f"No shelter with osm_id={osm_id} in region '{region}'")
+    shelters_df.loc[match, "available"] = req.available
     for field in ("wheelchair_accessible", "ground_floor", "medical_staff_onsite"):
         value = getattr(req, field)
         if value is not None:
-            SHELTERS_DF.loc[match, field] = value
-    SHELTERS_DF.to_csv("drc_katanga_shelters_final.csv", index=False)
-    updated = SHELTERS_DF.loc[match].iloc[0]
+            shelters_df.loc[match, field] = value
+    set_shelters_df(region, shelters_df)
+    shelters_df.to_csv(region_config.get_region(region)["shelters_csv"], index=False)
+    updated = shelters_df.loc[match].iloc[0]
     return {
         "osm_id": osm_id, "name": updated["name"],
         "available": int(updated["available"]), "capacity": int(updated["capacity"]),
@@ -884,13 +1061,15 @@ def update_shelter_availability(osm_id: str, req: ShelterAvailabilityRequest):
 def get_fwi(
     lat: float = Query(..., json_schema_extra={"example": -11.66}),
     lon: float = Query(..., json_schema_extra={"example": 27.48}),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
 ):
     """Computes the real Canadian Fire Weather Index (FFMC/DMC/DC/ISI/BUI/
-    FWI) for the nearest grid cell — an independent, internationally-used
-    fire-danger standard, run alongside (not replacing) the ML model, as a
-    cross-check. See compute_fwi()'s docstring for the approximations made
-    for this near-equatorial region."""
-    result = compute_fwi(lat, lon)
+    FWI) for the nearest grid cell in the given region — an independent,
+    internationally-used fire-danger standard, run alongside (not
+    replacing) the ML model, as a cross-check. Day-length factors adapt
+    automatically to the region's latitude — see compute_fwi()'s
+    docstring."""
+    result = compute_fwi(region, lat, lon)
     if result is None:
         raise HTTPException(status_code=404, detail="No weather data available for this location.")
     return result
@@ -904,27 +1083,48 @@ VISITS_LOG_CSV = "dashboard_visits.csv"
 
 
 @app.post("/track-visit")
-def track_visit():
+def track_visit(region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria")):
     """Increments a simple visit counter. The dashboard calls this once per
     browser session (not per interaction), giving the admin view a rough
-    usage signal."""
-    df = pd.read_csv(VISITS_LOG_CSV) if os.path.exists(VISITS_LOG_CSV) else pd.DataFrame(columns=["timestamp_utc"])
-    new_row = pd.DataFrame([{"timestamp_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")}])
+    usage signal, broken down by which region the visitor was looking at."""
+    df = (pd.read_csv(VISITS_LOG_CSV) if os.path.exists(VISITS_LOG_CSV)
+          else pd.DataFrame(columns=["timestamp_utc", "region"]))
+    if "region" not in df.columns:
+        df["region"] = region_config.DEFAULT_REGION  # back-fill old rows from before regions existed
+    new_row = pd.DataFrame([{"timestamp_utc": pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                              "region": region}])
     df = pd.concat([df, new_row], ignore_index=True)
     df.to_csv(VISITS_LOG_CSV, index=False)
     return {"status": "ok", "total_visits": len(df)}
 
 
 @app.get("/stats")
-def get_stats():
+def get_stats(region: Optional[str] = Query(None, description="Filter to one region; omit for all regions combined")):
     """Aggregate usage/activity numbers for the admin dashboard: visits,
     citizen fire reports, evacuation-assistance requests, and shelter
     capacity — all real, measured figures (not simulated), though visit
-    tracking only covers time since the last redeploy (ephemeral storage)."""
+    tracking only covers time since the last redeploy (ephemeral storage).
+    Pass ?region=congo or ?region=algeria to scope to one region, or omit
+    for every region combined."""
     visits_df = pd.read_csv(VISITS_LOG_CSV) if os.path.exists(VISITS_LOG_CSV) else pd.DataFrame()
     reports_df = _load_fire_reports()
     assistance_df = _load_assistance_requests()
     cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=7)
+
+    if region:
+        if not visits_df.empty and "region" in visits_df.columns:
+            visits_df = visits_df[visits_df["region"] == region]
+        if not reports_df.empty:
+            reports_df = reports_df[reports_df["region"] == region]
+        if not assistance_df.empty:
+            assistance_df = assistance_df[assistance_df["region"] == region]
+        shelters_df = get_shelters_df(region)
+    else:
+        # Combined across every region that has ever been loaded this
+        # process — good enough for a demo admin view; a persistent store
+        # would let this reflect regions not yet touched this run too.
+        shelters_frames = [get_shelters_df(rid) for rid in region_config.REGIONS]
+        shelters_df = pd.concat(shelters_frames, ignore_index=True)
 
     visits_last_7d = 0
     if not visits_df.empty:
@@ -946,9 +1146,9 @@ def get_stats():
         "total_fire_reports": len(reports_df), "fire_reports_last_7_days": reports_last_7d,
         "total_assistance_requests": len(assistance_df),
         "assistance_requests_last_7_days": assistance_last_7d,
-        "total_shelters": int(len(SHELTERS_DF)),
-        "total_shelter_capacity": int(SHELTERS_DF["capacity"].sum()),
-        "total_shelter_available": int(SHELTERS_DF["available"].sum()),
+        "total_shelters": int(len(shelters_df)),
+        "total_shelter_capacity": int(shelters_df["capacity"].sum()),
+        "total_shelter_available": int(shelters_df["available"].sum()),
     }
 
 
@@ -965,12 +1165,12 @@ def predict_future(req: PredictFutureRequest):
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
     try:
-        clim = CLIM_ENGINE.get_point_climatology(req.lat, req.lon, target_date)
+        clim = get_clim_engine(req.region).get_point_climatology(req.lat, req.lon, target_date)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     result = call_predict(
-        lat=clim["lat"], lon=clim["lon"], doy=clim["doy"],
+        region=req.region, lat=clim["lat"], lon=clim["lon"], doy=clim["doy"],
         t2m_max=clim["t2m_max"], t2m_min=clim["t2m_min"],
         rh2m=clim["rh2m"], ws2m=clim["ws2m"], prectotcorr=clim["prectotcorr"],
     )
@@ -986,17 +1186,20 @@ def predict_future(req: PredictFutureRequest):
 
 
 @app.get("/risk-map-future", response_model=List[RiskMapFutureResponse])
-def risk_map_future(date: date_type = Query(..., description="Future date to predict, e.g. 2026-09-15")):
+def risk_map_future(
+    date: date_type = Query(..., description="Future date to predict, e.g. 2026-09-15"),
+    region: str = Query(region_config.DEFAULT_REGION, description="congo or algeria"),
+):
     """Full-grid fire risk forecast for a FUTURE date, using climatology."""
     try:
-        clim_df = CLIM_ENGINE.get_climatology_for_date(date)
+        clim_df = get_clim_engine(region).get_climatology_for_date(date)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     results = []
     for _, row in clim_df.iterrows():
         r = call_predict(
-            lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
+            region=region, lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
             t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
             rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
         )
@@ -1053,7 +1256,7 @@ def predict_forecast_live(req: ForecastLiveRequest):
 
     if weather is None:
         try:
-            clim = CLIM_ENGINE.get_point_climatology(req.lat, req.lon, target_date)
+            clim = get_clim_engine(req.region).get_point_climatology(req.lat, req.lon, target_date)
             weather = {
                 "t2m_max": clim["t2m_max"], "t2m_min": clim["t2m_min"],
                 "rh2m": clim["rh2m"], "ws2m": clim["ws2m"],
@@ -1065,7 +1268,7 @@ def predict_forecast_live(req: ForecastLiveRequest):
 
     doy = target_date.timetuple().tm_yday
     result = call_predict(
-        lat=req.lat, lon=req.lon, doy=doy,
+        region=req.region, lat=req.lat, lon=req.lon, doy=doy,
         t2m_max=weather["t2m_max"], t2m_min=weather["t2m_min"],
         rh2m=weather["rh2m"], ws2m=weather["ws2m"], prectotcorr=weather["prectotcorr"],
     )
@@ -1083,7 +1286,7 @@ def predict_forecast_live(req: ForecastLiveRequest):
 # ===================================================================
 # USSD & Voice — Africa's Talking webhooks
 # ===================================================================
-def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
+def _ussd_forecast_summary(region: str, lat: float, lon: float, lang: str) -> str:
     """High-risk zone count FORECAST for today (via climatology) + nearest
     available shelter, in the requested language. Uses the climatology
     engine for today's date rather than the historical CSV's latest recorded
@@ -1091,10 +1294,10 @@ def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
     target_date = date_type.today()
     high_count = 0
     try:
-        clim_df = CLIM_ENGINE.get_climatology_for_date(target_date)
+        clim_df = get_clim_engine(region).get_climatology_for_date(target_date)
         for _, row in clim_df.iterrows():
             r = call_predict(
-                lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
+                region=region, lat=row["LAT"], lon=row["LON"], doy=row["DOY"],
                 t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
                 rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
             )
@@ -1103,7 +1306,8 @@ def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
     except ValueError:
         pass  # no historical data for this day-of-year — report 0 and continue
 
-    shelters = SHELTERS_DF[(SHELTERS_DF["is_shelter"]) & (SHELTERS_DF["available"] > 0)].copy()
+    shelters_df = get_shelters_df(region)
+    shelters = shelters_df[(shelters_df["is_shelter"]) & (shelters_df["available"] > 0)].copy()
     nearest_name, nearest_dist = None, None
     if not shelters.empty:
         shelters["distance_km"] = shelters.apply(
@@ -1123,13 +1327,84 @@ def _ussd_forecast_summary(lat: float, lon: float, lang: str) -> str:
                          if nearest_name else "Hakuna makazi yanayopatikana.")
         return (f"PHOENIX - Utabiri wa Moto ({date_str})\n"
                 f"Maeneo hatari zaidi (utabiri): {high_count}\n{shelter_line}\nKaa salama.")
+    if lang == "ar":
+        shelter_line = (f"أقرب ملجأ: {nearest_name} ({nearest_dist} كم)"
+                         if nearest_name else "لم يتم العثور على ملجأ متاح.")
+        return (f"فينيكس - توقعات الحرائق ({date_str})\n"
+                f"مناطق عالية الخطورة (متوقعة): {high_count}\n{shelter_line}\nابق آمنًا.")
     shelter_line = (f"Nearest shelter: {nearest_name} ({nearest_dist} km)"
                      if nearest_name else "No available shelter found.")
     return (f"PHOENIX - Fire Forecast ({date_str})\n"
             f"High-risk zones (forecast): {high_count}\n{shelter_line}\nStay safe.")
 
 
-_USSD_LANG_MAP = {"1": "en", "2": "fr", "3": "sw"}
+# Display name (in its own script) for each language code that ANY region
+# might offer — a region only shows the subset listed in its own
+# regions.py "languages" entry, so adding a region with a new language
+# just means adding one entry here plus the corresponding _USSD_TEXT
+# strings below.
+_LANGUAGE_LABELS = {"en": "English", "fr": "Francais", "sw": "Kiswahili", "ar": "العربية"}
+
+
+def _build_language_menu(region_cfg: dict) -> str:
+    """CON menu text offering only the languages this region actually
+    supports, numbered 1..N in the order regions.py lists them."""
+    lines = ["CON Choose your language / Choisissez / Chagua lugha:"]
+    for i, code in enumerate(region_cfg["languages"], start=1):
+        lines.append(f"{i}. {_LANGUAGE_LABELS.get(code, code)}")
+    return "\n".join(lines)
+
+
+def _resolve_language_choice(region_cfg: dict, choice: str) -> Optional[str]:
+    """Maps the digit the caller pressed back to a language code, scoped
+    to THIS region's language list (so pressing '3' means Swahili for
+    Congo but Arabic for Algeria — same digit, different meaning, exactly
+    matching what that region's menu just displayed)."""
+    langs = region_cfg["languages"]
+    idx = int(choice) - 1 if choice.isdigit() else -1
+    if 0 <= idx < len(langs):
+        return langs[idx]
+    return None
+
+
+def _build_region_menu() -> str:
+    lines = ["CON Welcome to PHOENIX Fire Alert\nBienvenue a PHOENIX\nمرحبا بكم في فينيكس\n"
+             "Choose your country / Choisissez / اختر بلدك:"]
+    for i, (rid, cfg) in enumerate(region_config.REGIONS.items(), start=1):
+        lines.append(f"{i}. {cfg['flag']} {cfg['label']}")
+    return "\n".join(lines)
+
+
+def _resolve_region_choice(choice: str) -> Optional[str]:
+    region_ids = list(region_config.REGIONS.keys())
+    idx = int(choice) - 1 if choice.isdigit() else -1
+    if 0 <= idx < len(region_ids):
+        return region_ids[idx]
+    return None
+
+
+def _build_province_menu(region_cfg: dict, prompt: dict) -> Dict[str, str]:
+    """Builds the CON menu text (per language) for choosing a province,
+    numbered 1..N from THIS region's actual province list — replaces the
+    old hardcoded 3-item Congo-only menu, since Algeria's prep script
+    assigned 13 wilayas, not 3."""
+    province_names = list(region_cfg["province_ref_points"].keys())
+    menu_by_lang = {}
+    for lang, header in prompt.items():
+        lines = [f"CON {header}"]
+        for i, name in enumerate(province_names, start=1):
+            lines.append(f"{i}. {name}")
+        menu_by_lang[lang] = "\n".join(lines)
+    return menu_by_lang
+
+
+def _resolve_province_choice(region_cfg: dict, choice: str) -> Optional[str]:
+    province_names = list(region_cfg["province_ref_points"].keys())
+    idx = int(choice) - 1 if choice.isdigit() else -1
+    if 0 <= idx < len(province_names):
+        return province_names[idx]
+    return None
+
 
 _USSD_TEXT = {
     "main_menu": {
@@ -1139,44 +1414,49 @@ _USSD_TEXT = {
               "3. Demander de l'aide pour evacuer (personnes agees/handicapees)",
         "sw": "CON Ungependa kufanya nini?\n1. Angalia hatari ya moto na makazi\n2. Ripoti moto ulioona\n"
               "3. Omba msaada wa uhamishaji (wazee/walemavu)",
+        "ar": "CON ماذا تريد أن تفعل؟\n1. التحقق من خطر الحريق والملجأ\n2. الإبلاغ عن حريق شاهدته\n"
+              "3. طلب مساعدة الإخلاء (كبار السن/ذوو الإعاقة)",
     },
-    "province_check": {
-        "en": "CON Choose your province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "fr": "CON Choisissez votre province:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "sw": "CON Chagua mkoa wako:\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    "province_check_prompt": {
+        "en": "Choose your province:", "fr": "Choisissez votre province:",
+        "sw": "Chagua mkoa wako:", "ar": "اختر منطقتك:",
     },
-    "province_report": {
-        "en": "CON Which province is the fire in?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "fr": "CON Dans quelle province est l'incendie ?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "sw": "CON Moto uko mkoa gani?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    "province_report_prompt": {
+        "en": "Which province is the fire in?", "fr": "Dans quelle province est l'incendie ?",
+        "sw": "Moto uko mkoa gani?", "ar": "في أي منطقة يوجد الحريق؟",
     },
-    "province_assistance": {
-        "en": "CON Which province do you need help in?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "fr": "CON Dans quelle province avez-vous besoin d'aide ?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
-        "sw": "CON Unahitaji msaada mkoa gani?\n1. Haut-Katanga\n2. Lualaba\n3. Tanganyika",
+    "province_assistance_prompt": {
+        "en": "Which province do you need help in?",
+        "fr": "Dans quelle province avez-vous besoin d'aide ?",
+        "sw": "Unahitaji msaada mkoa gani?", "ar": "في أي منطقة تحتاج المساعدة؟",
     },
     "invalid": {
         "en": "END Invalid choice.", "fr": "END Choix invalide.", "sw": "END Chaguo batili.",
+        "ar": "END اختيار غير صالح.",
     },
     "no_forecast": {
         "en": "No forecast available right now. Try again later.",
         "fr": "Aucune prevision disponible. Reessayez plus tard.",
         "sw": "Hakuna utabiri unaopatikana sasa. Jaribu tena baadaye.",
+        "ar": "لا توجد توقعات متاحة الآن. حاول مرة أخرى لاحقًا.",
     },
     "report_thanks": {
         "en": "END Thank you! Your report (#{id}) has been recorded for {province}. Stay safe.",
         "fr": "END Merci ! Votre signalement (#{id}) a ete enregistre pour {province}. Restez en securite.",
         "sw": "END Asante! Ripoti yako (#{id}) imesajiliwa kwa {province}. Kaa salama.",
+        "ar": "END شكرًا لك! تم تسجيل بلاغك (#{id}) لمنطقة {province}. ابق آمنًا.",
     },
     "report_cooldown": {
         "en": "END You already reported recently — thank you. Please wait a bit before reporting again.",
         "fr": "END Vous avez deja signale recemment — merci. Veuillez patienter avant de signaler a nouveau.",
         "sw": "END Tayari umeripoti hivi karibuni — asante. Tafadhali subiri kabla ya kuripoti tena.",
+        "ar": "END لقد أبلغت مؤخرًا بالفعل — شكرًا لك. يرجى الانتظار قليلاً قبل الإبلاغ مرة أخرى.",
     },
     "report_failed": {
         "en": "END Could not save your report right now. Please try again later.",
         "fr": "END Impossible d'enregistrer votre signalement. Reessayez plus tard.",
         "sw": "END Imeshindikana kuhifadhi ripoti yako. Jaribu tena baadaye.",
+        "ar": "END تعذر حفظ بلاغك الآن. يرجى المحاولة مرة أخرى لاحقًا.",
     },
     "assistance_thanks": {
         "en": "END Help request (#{id}) recorded for {province}. A responder will try to reach you. Stay safe.",
@@ -1184,6 +1464,8 @@ _USSD_TEXT = {
               "joindre. Restez en securite.",
         "sw": "END Ombi la msaada (#{id}) limesajiliwa kwa {province}. Mwokozi atajaribu kuwafikia. "
               "Kaa salama.",
+        "ar": "END تم تسجيل طلب المساعدة (#{id}) لمنطقة {province}. سيحاول أحد المستجيبين الوصول إليك. "
+              "ابق آمنًا.",
     },
     "assistance_cooldown": {
         "en": "END A help request was already sent recently — it's been recorded. Please wait a few "
@@ -1192,6 +1474,8 @@ _USSD_TEXT = {
               "patienter quelques minutes avant de redemander.",
         "sw": "END Ombi la msaada tayari limetumwa hivi karibuni — limesajiliwa. Tafadhali subiri "
               "dakika chache kabla ya kuomba tena.",
+        "ar": "END تم إرسال طلب مساعدة مؤخرًا بالفعل — وتم تسجيله. يرجى الانتظار بضع دقائق قبل الطلب مرة "
+              "أخرى.",
     },
     "assistance_failed": {
         "en": "END Could not save your help request right now. Please try again, or ask someone nearby "
@@ -1200,11 +1484,13 @@ _USSD_TEXT = {
               "quelqu'un a proximite.",
         "sw": "END Imeshindikana kuhifadhi ombi lako la msaada. Jaribu tena, au omba msaada kwa mtu "
               "aliye karibu.",
+        "ar": "END تعذر حفظ طلب المساعدة الآن. يرجى المحاولة مرة أخرى، أو طلب المساعدة من شخص قريب منك.",
     },
     "session_error": {
         "en": "END Session error. Please try again.",
         "fr": "END Erreur de session. Reessayez.",
         "sw": "END Hitilafu ya kikao. Tafadhali jaribu tena.",
+        "ar": "END خطأ في الجلسة. يرجى المحاولة مرة أخرى.",
     },
 }
 
@@ -1215,77 +1501,118 @@ async def ussd(request: Request):
     Africa's Talking console pointed at this URL — anyone can then dial the
     assigned code from ANY phone (no smartphone, app, or internet needed) to
     check the fire risk FORECAST and nearest shelter, OR report a fire they
-    saw, in English, French, or Swahili.
+    saw, OR request evacuation help — in whichever languages the chosen
+    region supports.
+
+    Every deployed region normally gets its OWN USSD service code from
+    Africa's Talking (a code is tied to one country's telecom routing), so
+    in practice a caller in Congo and a caller in Algeria would dial
+    different numbers that both point at this SAME endpoint — the region
+    picker below exists mainly for testing multiple regions against one
+    shared USSD code/simulator, and degrades gracefully to "just Congo"
+    for any region without its own registered code yet (see
+    regions.py's "ussd_code": None for Algeria).
 
     Protocol: Africa's Talking POSTs form-encoded sessionId / serviceCode /
     phoneNumber / text. `text` accumulates the caller's choices separated by
     '*' as the session progresses (e.g. '', '1', '1*2', '1*2*1'). The
     response must start with 'CON ' to keep the session open and show
-    another menu, or 'END ' to send a final message and hang up."""
+    another menu, or 'END ' to send a final message and hang up.
+
+    Menu depth: [0] region -> [1] language -> [2] action -> [3] province."""
     form = await request.form()
     text = form.get("text", "")
     phone_number = form.get("phoneNumber", "")
     steps = text.split("*") if text else []
 
+    # Step 0: no input yet -> show the region picker.
     if text == "":
-        response = "CON Welcome to PHOENIX Fire Alert\nBienvenue a PHOENIX\nKaribu PHOENIX\n1. English\n2. Francais\n3. Kiswahili"
+        response = _build_region_menu()
 
+    # Step 1: region chosen -> show that region's language menu.
     elif len(steps) == 1:
-        lang = _USSD_LANG_MAP.get(steps[0], "en")
-        response = _USSD_TEXT["main_menu"][lang]
+        region = _resolve_region_choice(steps[0])
+        if region is None:
+            response = _USSD_TEXT["invalid"]["en"]  # no region selected yet, default to English for this one message
+        else:
+            response = _build_language_menu(region_config.get_region(region))
 
+    # Step 2: region + language chosen -> show the main action menu.
     elif len(steps) == 2:
-        lang = _USSD_LANG_MAP.get(steps[0], "en")
-        action = steps[1]
-        if action not in ("1", "2", "3"):
-            response = _USSD_TEXT["invalid"][lang]
-        elif action == "1":
-            response = _USSD_TEXT["province_check"][lang]
-        elif action == "2":
-            response = _USSD_TEXT["province_report"][lang]
+        region = _resolve_region_choice(steps[0])
+        if region is None:
+            response = _USSD_TEXT["invalid"]["en"]
         else:
-            response = _USSD_TEXT["province_assistance"][lang]
+            cfg = region_config.get_region(region)
+            lang = _resolve_language_choice(cfg, steps[1])
+            if lang is None:
+                response = _USSD_TEXT["invalid"]["en"]
+            else:
+                response = _USSD_TEXT["main_menu"][lang]
 
+    # Step 3: region + language + action chosen -> show the province menu
+    # for that specific action (check / report / assistance).
     elif len(steps) == 3:
-        lang = _USSD_LANG_MAP.get(steps[0], "en")
-        action = steps[1]
-        province = {"1": "Haut-Katanga", "2": "Lualaba", "3": "Tanganyika"}.get(steps[2])
-        if not province:
-            response = _USSD_TEXT["invalid"][lang]
-        elif action == "1":
-            ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
-            try:
-                summary = _ussd_forecast_summary(ref_lat, ref_lon, lang)
-            except Exception:
-                summary = _USSD_TEXT["no_forecast"][lang]
-            response = f"END {summary}"
-        elif action == "2":
-            # Crowd-sourced report — no GPS on USSD, so we log it at the
-            # province's reference point. Good enough for "something is
-            # happening in this province, worth a look" — not a precise pin.
-            ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
-            try:
-                report_id = _save_fire_report(province, ref_lat, ref_lon, phone_number)
-                response = _USSD_TEXT["report_thanks"][lang].format(id=report_id, province=province)
-            except FireReportCooldownError:
-                response = _USSD_TEXT["report_cooldown"][lang]
-            except Exception:
-                response = _USSD_TEXT["report_failed"][lang]
+        region = _resolve_region_choice(steps[0])
+        if region is None:
+            response = _USSD_TEXT["invalid"]["en"]
         else:
-            # Evacuation assistance request — same province-level location
-            # limitation as fire reports (no GPS on USSD).
-            ref_lat, ref_lon = PROVINCE_REF_POINTS[province]
-            try:
-                request_id = _save_assistance_request(province, ref_lat, ref_lon, phone_number)
-                response = _USSD_TEXT["assistance_thanks"][lang].format(id=request_id, province=province)
-            except FireReportCooldownError:
-                response = _USSD_TEXT["assistance_cooldown"][lang]
-            except Exception:
-                response = _USSD_TEXT["assistance_failed"][lang]
+            cfg = region_config.get_region(region)
+            lang = _resolve_language_choice(cfg, steps[1])
+            action = steps[2]
+            if lang is None or action not in ("1", "2", "3"):
+                response = _USSD_TEXT["invalid"][lang or "en"]
+            else:
+                prompt_key = {"1": "province_check_prompt", "2": "province_report_prompt",
+                              "3": "province_assistance_prompt"}[action]
+                menu_by_lang = _build_province_menu(cfg, _USSD_TEXT[prompt_key])
+                response = menu_by_lang[lang]
+
+    # Step 4: everything chosen, including province -> take the action.
+    elif len(steps) == 4:
+        region = _resolve_region_choice(steps[0])
+        if region is None:
+            response = _USSD_TEXT["invalid"]["en"]
+        else:
+            cfg = region_config.get_region(region)
+            lang = _resolve_language_choice(cfg, steps[1])
+            action = steps[2]
+            province = _resolve_province_choice(cfg, steps[3])
+            if lang is None or province is None:
+                response = _USSD_TEXT["invalid"][lang or "en"]
+            elif action == "1":
+                ref_lat, ref_lon = cfg["province_ref_points"][province]
+                try:
+                    summary = _ussd_forecast_summary(region, ref_lat, ref_lon, lang)
+                except Exception:
+                    summary = _USSD_TEXT["no_forecast"][lang]
+                response = f"END {summary}"
+            elif action == "2":
+                # Crowd-sourced report — no GPS on USSD, so we log it at the
+                # province's reference point. Good enough for "something is
+                # happening in this province, worth a look" — not a precise pin.
+                ref_lat, ref_lon = cfg["province_ref_points"][province]
+                try:
+                    report_id = _save_fire_report(region, province, ref_lat, ref_lon, phone_number)
+                    response = _USSD_TEXT["report_thanks"][lang].format(id=report_id, province=province)
+                except FireReportCooldownError:
+                    response = _USSD_TEXT["report_cooldown"][lang]
+                except Exception:
+                    response = _USSD_TEXT["report_failed"][lang]
+            else:
+                # Evacuation assistance request — same province-level location
+                # limitation as fire reports (no GPS on USSD).
+                ref_lat, ref_lon = cfg["province_ref_points"][province]
+                try:
+                    request_id = _save_assistance_request(region, province, ref_lat, ref_lon, phone_number)
+                    response = _USSD_TEXT["assistance_thanks"][lang].format(id=request_id, province=province)
+                except FireReportCooldownError:
+                    response = _USSD_TEXT["assistance_cooldown"][lang]
+                except Exception:
+                    response = _USSD_TEXT["assistance_failed"][lang]
 
     else:
-        lang = _USSD_LANG_MAP.get(steps[0], "en") if steps else "en"
-        response = _USSD_TEXT["session_error"][lang]
+        response = _USSD_TEXT["session_error"]["en"]
 
     return PlainTextResponse(content=response, media_type="text/plain")
 
