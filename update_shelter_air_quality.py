@@ -1,29 +1,36 @@
 """
-Update Shelter Air Quality — Open-Meteo auto-refresh
-=========================================================
-Refreshes the pm2_5 / us_aqi / observation_time columns in
-drc_katanga_shelters_final.csv for every shelter/facility, using
-Open-Meteo's free Air Quality API (batched — one request per chunk of
-locations, not one request per shelter, since there can be thousands
-of shelters and Open-Meteo supports many coordinates per request via
-comma-separated lat/lon lists).
+Update Shelter Air Quality — Open-Meteo auto-refresh (multi-region)
+=========================================================================
+Refreshes the pm2_5 / us_aqi / observation_time columns in the SELECTED
+REGION's shelters CSV, for every shelter/facility, using Open-Meteo's free
+Air Quality API (batched — one request per chunk of locations, not one
+request per shelter, since there can be thousands of shelters and
+Open-Meteo supports many coordinates per request via comma-separated
+lat/lon lists).
 
-Meant to be run on a schedule (see .github/workflows/update-climate-data.yml,
-which runs this alongside the climate update). Air quality changes much
-faster than climate/fire risk, so if you want it fresher than once a day,
-add a second `schedule:` entry with a shorter interval in that workflow.
+Meant to be run on a schedule (see .github/workflows/update-data.yml,
+which runs this alongside the climate update), once per region. Air
+quality changes much faster than climate/fire risk, so if you want it
+fresher than once a day, add a second `schedule:` entry with a shorter
+interval in that workflow.
 
 Run manually:
-    python update_shelter_air_quality.py
+    python update_shelter_air_quality.py --region congo
+    python update_shelter_air_quality.py --region algeria
+
+Adding a region: this script needs no changes — it reads/writes whichever
+CSV path regions.py's REGIONS[<id>]["shelters_csv"] points to.
 """
 
+import argparse
 import sys
 import time
 
 import pandas as pd
 import requests
 
-SHELTERS_CSV = "drc_katanga_shelters_final.csv"
+import regions as region_config
+
 OPEN_METEO_AQ_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 # Open-Meteo supports many locations per request via comma-separated
@@ -70,9 +77,13 @@ def fetch_chunk(lats, lons):
     return results
 
 
-def main():
-    print(f"Loading {SHELTERS_CSV} ...")
-    df = pd.read_csv(SHELTERS_CSV)
+def update_region(region_id: str):
+    cfg = region_config.get_region(region_id)
+    shelters_csv = cfg["shelters_csv"]
+
+    print(f"=== Region: {cfg['flag']} {cfg['label']} ({shelters_csv}) ===")
+    print(f"Loading {shelters_csv} ...")
+    df = pd.read_csv(shelters_csv)
     print(f"Found {len(df)} shelters/facilities.")
 
     pm25_col, aqi_col, obs_col = [], [], []
@@ -90,9 +101,17 @@ def main():
     df["us_aqi"] = aqi_col
     df["observation_time"] = obs_col
 
-    df.to_csv(SHELTERS_CSV, index=False)
+    df.to_csv(shelters_csv, index=False)
     updated = df["pm2_5"].notna().sum()
     print(f"Saved. {updated}/{len(df)} shelters got fresh air-quality data.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--region", required=True, choices=list(region_config.REGIONS.keys()),
+                         help="Which region's shelters file to refresh.")
+    args = parser.parse_args()
+    update_region(args.region)
 
 
 if __name__ == "__main__":
