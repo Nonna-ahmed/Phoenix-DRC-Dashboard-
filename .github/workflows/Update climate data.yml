@@ -1,4 +1,3 @@
-```yaml
 name: Update data & send alerts
 
 on:
