@@ -1129,631 +1129,637 @@ with tab1:
     shelter_only = shelters[shelters["is_shelter"]]
     col4.metric("Shelters with capacity", int((shelter_only["available"] > 0).sum()))
 
-    # Map
-    st.subheader("Live Risk Map")
+    subtab1a, subtab1b, subtab1c, subtab1d = st.tabs([
+        "🗺️ Map & Zone Details", "🏠 Shelters", "📊 Validation", "📈 Trends",
+    ])
 
-    center_lat = res_df["LAT"].mean()
-    center_lon = res_df["LON"].mean()
+    with subtab1a:
+        # Map
+        st.subheader("Live Risk Map")
 
-    m = folium.Map(
-        location=[center_lat, center_lon],
-        zoom_start=6,
-        tiles="OpenStreetMap"
-    )
+        center_lat = res_df["LAT"].mean()
+        center_lon = res_df["LON"].mean()
 
-    risk_features = []
-    for _, row in res_df.iterrows():
-        pm25_val = row.get("pm2_5")
-        health_level_val = row.get("health_level")
-        health_advice_val = row.get("health_advice")
-        risk_features.append({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [row["LON"], row["LAT"]]},
-            "properties": {
-                "risk_level": row["risk_level"],
-                "fire_probability_pct": round(row["fire_probability"] * 100, 1) if pd.notna(row["fire_probability"]) else None,
-                "t2m_max": round(row["T2M_MAX"], 1),
-                "rh2m": round(row["RH2M"], 1),
-                "health_level": health_level_val if pd.notna(health_level_val) else "N/A",
-                "pm2_5": round(float(pm25_val), 0) if pd.notna(pm25_val) else None,
-                "health_advice": health_advice_val if pd.notna(health_advice_val) else "",
-            },
-        })
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=6,
+            tiles="OpenStreetMap"
+        )
 
-    def risk_style_function(feature):
-        color = COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
-        return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
+        risk_features = []
+        for _, row in res_df.iterrows():
+            pm25_val = row.get("pm2_5")
+            health_level_val = row.get("health_level")
+            health_advice_val = row.get("health_advice")
+            risk_features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [row["LON"], row["LAT"]]},
+                "properties": {
+                    "risk_level": row["risk_level"],
+                    "fire_probability_pct": round(row["fire_probability"] * 100, 1) if pd.notna(row["fire_probability"]) else None,
+                    "t2m_max": round(row["T2M_MAX"], 1),
+                    "rh2m": round(row["RH2M"], 1),
+                    "health_level": health_level_val if pd.notna(health_level_val) else "N/A",
+                    "pm2_5": round(float(pm25_val), 0) if pd.notna(pm25_val) else None,
+                    "health_advice": health_advice_val if pd.notna(health_advice_val) else "",
+                },
+            })
 
-    folium.GeoJson(
-        {"type": "FeatureCollection", "features": risk_features},
-        name="Fire risk zones",
-        marker=folium.CircleMarker(radius=14, fill=True),
-        style_function=risk_style_function,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5"],
-            aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
-                     "Air quality:", "PM2.5 (µg/m³):"],
-            sticky=True,
-        ),
-        popup=folium.GeoJsonPopup(
-            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5", "health_advice"],
-            aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
-                     "Air quality:", "PM2.5 (µg/m³):", "Advice:"],
-            max_width=260,
-        ),
-    ).add_to(m)
+        def risk_style_function(feature):
+            color = COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
+            return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
 
-    heat_data = [[row["LAT"], row["LON"], row["fire_probability"]] for _, row in res_df.iterrows() if pd.notna(row["fire_probability"])]
-    heat_fg = folium.FeatureGroup(name="Risk density (heatmap)", show=False)
-    HeatMap(heat_data, radius=18, blur=22, max_zoom=8).add_to(heat_fg)
-    heat_fg.add_to(m)
-
-    # ---------------------------------------------------------------
-    # Wind direction arrows — only available for dates fetched after WD2M
-    # was added to update_climate_data.py; older historical dates won't
-    # have this column, so the layer is simply empty (not an error) then.
-    # ---------------------------------------------------------------
-    if "WD2M" in day_data.columns and day_data["WD2M"].notna().any():
-        wind_fg = folium.FeatureGroup(name="🧭 Wind direction", show=False)
-        for _, wrow in day_data.dropna(subset=["WD2M"]).iterrows():
-            # WD2M is the direction wind blows FROM (meteorological convention);
-            # rotate +180° so the arrow visually points where the wind is
-            # blowing TO — i.e. the direction fire would likely spread.
-            heading = (float(wrow["WD2M"]) + 180) % 360
-            arrow_html = (
-                f'<div style="transform: rotate({heading}deg); font-size: 22px; '
-                f'color: #01579b; text-shadow: 0 0 3px white;">➤</div>'
-            )
-            folium.Marker(
-                location=[wrow["LAT"], wrow["LON"]],
-                icon=folium.DivIcon(html=arrow_html, icon_size=(24, 24), icon_anchor=(12, 12)),
-                tooltip=f"Wind from {wrow['WD2M']:.0f}° · likely spread direction shown",
-            ).add_to(wind_fg)
-        wind_fg.add_to(m)
-
-    shelter_cluster = MarkerCluster(name="Shelters & Resources").add_to(m)
-    shelters_to_draw = shelters.sort_values("capacity", ascending=False).head(max_markers)
-
-    for _, s in shelters_to_draw.iterrows():
-        if s["is_shelter"]:
-            color = "blue"
-            kind = "Shelter"
-        else:
-            color = "darkcyan"
-            kind = "Support resource (not for housing evacuees)"
-
-        aqi_html = ""
-        pm25_shelter = s.get("pm2_5")
-        us_aqi_shelter = s.get("us_aqi")
-
-        if pd.notna(pm25_shelter):
-            if pd.notna(us_aqi_shelter):
-                aqi_html = (
-                    f"<br><b>🫁 Current AQI:</b> "
-                    f"{float(us_aqi_shelter):.0f} "
-                    f"(PM2.5: {float(pm25_shelter):.1f} µg/m³)"
-                )
-            else:
-                aqi_html = f"<br><b>🫁 PM2.5:</b> {float(pm25_shelter):.1f} µg/m³"
-            observation_time = s.get("observation_time")
-            if pd.notna(observation_time):
-                aqi_html += f"<br><small>as of {observation_time}</small>"
-
-        folium.CircleMarker(
-            location=[s["lat"], s["lon"]],
-            radius=6,
-            color=color,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.8,
-            weight=1,
-            popup=folium.Popup(
-                f"<b>{s['name']}</b><br>"
-                f"{kind}<br>"
-                f"{s['province']}<br>"
-                f"Est. capacity: {s['available']}/{s['capacity']}"
-                f"{aqi_html}",
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": risk_features},
+            name="Fire risk zones",
+            marker=folium.CircleMarker(radius=14, fill=True),
+            style_function=risk_style_function,
+            tooltip=folium.GeoJsonTooltip(
+                fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5"],
+                aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
+                         "Air quality:", "PM2.5 (µg/m³):"],
+                sticky=True,
+            ),
+            popup=folium.GeoJsonPopup(
+                fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m", "health_level", "pm2_5", "health_advice"],
+                aliases=["Risk:", "Fire probability (%):", "Max temp (°C):", "Humidity (%):",
+                         "Air quality:", "PM2.5 (µg/m³):", "Advice:"],
                 max_width=260,
             ),
-            tooltip=s["name"],
-        ).add_to(shelter_cluster)
+        ).add_to(m)
 
-    # ---------------------------------------------------------------
-    # NASA FIRMS — confirmed active fires (satellite-observed, not predicted)
-    # ---------------------------------------------------------------
-    fires_df, fires_status = fetch_active_fires()
-    if fires_status == "ok" and not fires_df.empty:
-        fires_fg = folium.FeatureGroup(name="🔥 Confirmed fires (NASA FIRMS, live)", show=True)
-        for _, f in fires_df.iterrows():
-            confidence = f.get("confidence", "n/a")
-            folium.Marker(
-                location=[f["latitude"], f["longitude"]],
-                icon=folium.Icon(color="orange", icon="fire", prefix="fa"),
-                tooltip=f"Confirmed fire · {f.get('acq_date', '')} {f.get('acq_time', '')}",
-                popup=folium.Popup(
-                    f"<b>🔥 Confirmed active fire</b><br>"
-                    f"Satellite-detected (NASA FIRMS)<br>"
-                    f"Date: {f.get('acq_date', 'n/a')} {f.get('acq_time', 'n/a')} UTC<br>"
-                    f"Satellite: {f.get('satellite', 'n/a')}<br>"
-                    f"Confidence: {confidence}<br>"
-                    f"Fire radiative power: {f.get('frp', 'n/a')} MW",
-                    max_width=260,
-                ),
-            ).add_to(fires_fg)
-        fires_fg.add_to(m)
+        heat_data = [[row["LAT"], row["LON"], row["fire_probability"]] for _, row in res_df.iterrows() if pd.notna(row["fire_probability"])]
+        heat_fg = folium.FeatureGroup(name="Risk density (heatmap)", show=False)
+        HeatMap(heat_data, radius=18, blur=22, max_zoom=8).add_to(heat_fg)
+        heat_fg.add_to(m)
 
-    # ---------------------------------------------------------------
-    # Citizen-reported fires (crowd-sourced via USSD "Report a fire")
-    # ---------------------------------------------------------------
-    reports_df, reports_status = fetch_fire_reports(region_id)
-    if reports_status == "ok" and not reports_df.empty:
-        reports_fg = folium.FeatureGroup(name="📢 Citizen fire reports (last 72h)", show=True)
-        for _, rep in reports_df.iterrows():
-            folium.Marker(
-                location=[rep["lat"], rep["lon"]],
-                icon=folium.Icon(color="darkred", icon="bullhorn", prefix="fa"),
-                tooltip=f"Citizen report · {rep.get('province', '')}",
-                popup=folium.Popup(
-                    f"<b>📢 Citizen-reported fire</b><br>"
-                    f"Province: {rep.get('province', 'n/a')}<br>"
-                    f"Reported: {rep.get('reported_at_utc', 'n/a')} UTC<br>"
-                    f"<small>Approximate location (province reference point — USSD "
-                    f"callers have no GPS), not a precise pin.</small>",
-                    max_width=260,
-                ),
-            ).add_to(reports_fg)
-        reports_fg.add_to(m)
+        # ---------------------------------------------------------------
+        # Wind direction arrows — only available for dates fetched after WD2M
+        # was added to update_climate_data.py; older historical dates won't
+        # have this column, so the layer is simply empty (not an error) then.
+        # ---------------------------------------------------------------
+        if "WD2M" in day_data.columns and day_data["WD2M"].notna().any():
+            wind_fg = folium.FeatureGroup(name="🧭 Wind direction", show=False)
+            for _, wrow in day_data.dropna(subset=["WD2M"]).iterrows():
+                # WD2M is the direction wind blows FROM (meteorological convention);
+                # rotate +180° so the arrow visually points where the wind is
+                # blowing TO — i.e. the direction fire would likely spread.
+                heading = (float(wrow["WD2M"]) + 180) % 360
+                arrow_html = (
+                    f'<div style="transform: rotate({heading}deg); font-size: 22px; '
+                    f'color: #01579b; text-shadow: 0 0 3px white;">➤</div>'
+                )
+                folium.Marker(
+                    location=[wrow["LAT"], wrow["LON"]],
+                    icon=folium.DivIcon(html=arrow_html, icon_size=(24, 24), icon_anchor=(12, 12)),
+                    tooltip=f"Wind from {wrow['WD2M']:.0f}° · likely spread direction shown",
+                ).add_to(wind_fg)
+            wind_fg.add_to(m)
 
-    # ---------------------------------------------------------------
-    # Evacuation assistance requests (elderly/disabled needing help)
-    # ---------------------------------------------------------------
-    assist_df, assist_status = fetch_assistance_requests(region_id)
-    if assist_status == "ok" and not assist_df.empty:
-        assist_fg = folium.FeatureGroup(name="♿ Evacuation assistance needed (last 72h)", show=True)
-        for _, req in assist_df.iterrows():
-            folium.Marker(
-                location=[req["lat"], req["lon"]],
-                icon=folium.Icon(color="purple", icon="wheelchair", prefix="fa"),
-                tooltip=f"Assistance needed · {req.get('province', '')}",
-                popup=folium.Popup(
-                    f"<b>♿ Evacuation assistance requested</b><br>"
-                    f"Province: {req.get('province', 'n/a')}<br>"
-                    f"Requested: {req.get('requested_at_utc', 'n/a')} UTC<br>"
-                    f"Contact: {req.get('phone_number', 'n/a')}<br>"
-                    f"<small>Approximate location (province reference point — USSD "
-                    f"callers have no GPS), not a precise pin.</small>",
-                    max_width=260,
-                ),
-            ).add_to(assist_fg)
-        assist_fg.add_to(m)
+        shelter_cluster = MarkerCluster(name="Shelters & Resources").add_to(m)
+        shelters_to_draw = shelters.sort_values("capacity", ascending=False).head(max_markers)
 
-    # Route from the selected zone (if any) to its nearest shelter. Uses the
-    # PREVIOUS click's selection from session_state — this run's own click
-    # (if any) is only known after st_folium returns further below, so the
-    # click handler triggers an immediate rerun to make the route appear
-    # right away instead of one interaction later.
-    _sel = st.session_state.get("tab1_selected_zone")
-    if _sel and _sel.get("shelter_lat") is not None:
-        _route_mode = st.session_state.get("tab1_route_mode", "foot")
-        _route_latlon, _route_dist_km, _route_dur_min = fetch_route(
-            _sel["lat"], _sel["lon"], _sel["shelter_lat"], _sel["shelter_lon"], profile=_route_mode
-        )
-        if _route_latlon:
-            _mode_label = "walking" if _route_mode == "foot" else "driving"
-            folium.PolyLine(
-                _route_latlon, color="#1976d2", weight=5, opacity=0.85,
-                tooltip=f"{_route_dist_km:.1f} km · ~{_route_dur_min:.0f} min ({_mode_label})",
-            ).add_to(m)
-
-            # OSRM snaps the start/end to the nearest road IT knows about —
-            # in remote areas with incomplete OpenStreetMap road coverage,
-            # that snapped point can be a real gap away from the actual
-            # zone/shelter location. Close that visual gap with a dashed
-            # line so it's clear which part is a real mapped road vs. an
-            # off-road estimate, instead of the line just looking "cut off".
-            def _gap_km(lat1, lon1, lat2, lon2):
-                dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
-                a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-                return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
-
-            _route_start, _route_end = _route_latlon[0], _route_latlon[-1]
-            _start_gap = _gap_km(_route_start[0], _route_start[1], _sel["lat"], _sel["lon"])
-            _end_gap = _gap_km(_route_end[0], _route_end[1], _sel["shelter_lat"], _sel["shelter_lon"])
-            if _start_gap > 0.05:
-                folium.PolyLine(
-                    [[_sel["lat"], _sel["lon"]], _route_start],
-                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
-                    tooltip=f"Off-road (~{_start_gap:.1f} km) — no mapped road here, straight-line estimate",
-                ).add_to(m)
-            if _end_gap > 0.05:
-                folium.PolyLine(
-                    [_route_end, [_sel["shelter_lat"], _sel["shelter_lon"]]],
-                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
-                    tooltip=f"Off-road (~{_end_gap:.1f} km) — no mapped road here, straight-line estimate",
-                ).add_to(m)
-
-            folium.Marker(
-                [_sel["lat"], _sel["lon"]],
-                icon=folium.Icon(color="red", icon="fire", prefix="fa"),
-                tooltip="Selected zone",
-            ).add_to(m)
-            folium.Marker(
-                [_sel["shelter_lat"], _sel["shelter_lon"]],
-                icon=folium.Icon(color="green", icon="home", prefix="fa"),
-                tooltip=_sel.get("shelter_name") or "Nearest shelter",
-            ).add_to(m)
-            st.session_state["tab1_route_info"] = {
-                "distance_km": _route_dist_km, "duration_min": _route_dur_min, "mode": _route_mode,
-            }
-        else:
-            st.session_state["tab1_route_info"] = None
-
-    folium.LayerControl(position="topleft", collapsed=False).add_to(m)
-
-    if len(shelters) > max_markers:
-        st.caption(
-            f"Showing the {max_markers} largest-capacity locations "
-            f"out of {len(shelters)} matching your filters."
-        )
-
-    map_data = st_folium(
-        m, use_container_width=True, height=550,
-        returned_objects=["last_active_drawing"],
-    )
-
-    if fires_status == "no_key":
-        st.caption("🔥 **Confirmed fires (NASA FIRMS)** layer needs a free API key — add `FIRMS_MAP_KEY` "
-                   "to Streamlit secrets (get one at https://firms.modaps.eosdis.nasa.gov/api/map_key/) "
-                   "to see satellite-confirmed fires alongside the predicted risk zones.")
-    elif fires_status == "fetch_failed":
-        st.caption("🔥 Couldn't reach NASA FIRMS just now (network hiccup) — confirmed-fire markers are "
-                   "temporarily unavailable. Predicted risk zones above are unaffected.")
-
-    # ---------------------------------------------------------------
-    # Zone selection (click a risk zone on the map above)
-    # ---------------------------------------------------------------
-    if "tab1_selected_zone" not in st.session_state:
-        st.session_state.tab1_selected_zone = None
-    if "tab1_route_mode" not in st.session_state:
-        st.session_state.tab1_route_mode = "foot"
-    if "tab1_last_click_key" not in st.session_state:
-        st.session_state.tab1_last_click_key = None
-
-    clicked = map_data.get("last_active_drawing") if map_data else None
-    if clicked and clicked.get("geometry", {}).get("type") == "Point":
-        lon_c, lat_c = clicked["geometry"]["coordinates"]
-        click_key = (round(lat_c, 6), round(lon_c, 6))
-        props = clicked.get("properties", {})
-        # Only act on risk-zone features (ignore shelter markers), and only
-        # on a NEW click — st_folium keeps returning the same last click on
-        # every rerun, and without this guard the st.rerun() below (which
-        # makes the route appear immediately) would loop forever.
-        if props.get("risk_level") is not None and click_key != st.session_state.tab1_last_click_key:
-            st.session_state.tab1_last_click_key = click_key
-            shelter_pool = shelters_all[shelters_all["is_shelter"]]
-            nearest = nearest_facility([lat_c], [lon_c], shelter_pool)
-            shelter_name = nearest.iloc[0]["name"] if not nearest.empty else None
-            shelter_dist = nearest.iloc[0]["distance_km"] if not nearest.empty else None
-            shelter_lat = float(nearest.iloc[0]["lat"]) if not nearest.empty else None
-            shelter_lon = float(nearest.iloc[0]["lon"]) if not nearest.empty else None
-            st.session_state.tab1_selected_zone = {
-                "lat": lat_c, "lon": lon_c,
-                "risk_level": props.get("risk_level"),
-                "fire_probability_pct": props.get("fire_probability_pct"),
-                "pm2_5": props.get("pm2_5"),
-                "health_level": props.get("health_level"),
-                "shelter_name": shelter_name,
-                "shelter_dist": shelter_dist,
-                "shelter_lat": shelter_lat,
-                "shelter_lon": shelter_lon,
-            }
-            st.rerun()  # redraw the map now, with the route included
-
-    zone = st.session_state.tab1_selected_zone
-    if zone:
-        st.markdown("### 📍 Selected Zone")
-        zc1, zc2, zc3 = st.columns(3)
-        zc1.metric("Risk Level", zone["risk_level"] or "N/A")
-        zc2.metric("Fire Probability",
-                   f"{zone['fire_probability_pct']}%" if zone["fire_probability_pct"] is not None else "N/A")
-        aqi_label = (f"{zone['pm2_5']:.0f} µg/m³ ({zone['health_level']})"
-                     if zone["pm2_5"] is not None else "No live data")
-        zc3.metric("Air Quality (PM2.5)", aqi_label)
-        if zone["shelter_name"]:
-            st.caption(f"🏠 Nearest shelter: **{zone['shelter_name']}** ({zone['shelter_dist']:.1f} km away, straight-line)")
-
-            mode_label = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab1_route_mode_radio")
-            new_mode = "foot" if "Walking" in mode_label else "driving"
-            if new_mode != st.session_state.tab1_route_mode:
-                st.session_state.tab1_route_mode = new_mode
-                st.rerun()
-
-            route_info = st.session_state.get("tab1_route_info")
-            if route_info:
-                mode_txt = "walking" if route_info["mode"] == "foot" else "driving"
-                est_note = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
-                    if route_info["mode"] == "foot" else ""
-                st.success(f"🛣️ Road route: **{route_info['distance_km']:.1f} km**, "
-                           f"~**{route_info['duration_min']:.0f} min** ({mode_txt}){est_note} — shown on the map above.")
+        for _, s in shelters_to_draw.iterrows():
+            if s["is_shelter"]:
+                color = "blue"
+                kind = "Shelter"
             else:
-                st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
-                           "showing straight-line distance only.")
-        else:
-            st.caption("🏠 No nearby shelter found.")
+                color = "darkcyan"
+                kind = "Support resource (not for housing evacuees)"
 
-        st.markdown("**🔬 Cross-check: Canadian Fire Weather Index**")
-        if st.button("Calculate real FWI (independent standard)", key="tab1_fwi_btn"):
-            with st.spinner("Running the Canadian FWI System over the full historical record..."):
-                try:
-                    fwi_resp = requests.get(f"{API_BASE_URL}/fwi",
-                                             params={"lat": zone["lat"], "lon": zone["lon"], "region": region_id},
-                                             timeout=30)
-                    fwi_resp.raise_for_status()
-                    st.session_state.tab1_fwi_result = fwi_resp.json()
-                except Exception as e:
-                    st.session_state.tab1_fwi_result = None
-                    st.warning(f"Couldn't compute FWI: {e}")
-        fwi_result = st.session_state.get("tab1_fwi_result")
-        if fwi_result:
-            fc1, fc2, fc3 = st.columns(3)
-            fc1.metric("FWI (danger)", f"{fwi_result['fwi']} · {fwi_result['danger_class']}")
-            fc2.metric("FFMC", fwi_result["ffmc"])
-            fc3.metric("BUI", fwi_result["bui"])
-            st.caption(f"As of {fwi_result['as_of_date']} — an internationally-used, independently "
-                       f"validated fire-danger standard (Van Wagner 1987), run separately from the ML "
-                       f"model as a cross-check, not a replacement.")
+            aqi_html = ""
+            pm25_shelter = s.get("pm2_5")
+            us_aqi_shelter = s.get("us_aqi")
 
-        st.markdown("**👥 Affected population**")
-        if st.button("Estimate population in this area (WorldPop)", key="tab1_pop_btn"):
-            with st.spinner("Querying WorldPop (can take up to ~1 minute — their server is sometimes slow)..."):
-                pop_count, pop_error = fetch_population_estimate(zone["lat"], zone["lon"])
-            if pop_error:
-                st.warning(f"Couldn't get a population estimate: {pop_error}")
-                st.session_state.tab1_pop_estimate = None
+            if pd.notna(pm25_shelter):
+                if pd.notna(us_aqi_shelter):
+                    aqi_html = (
+                        f"<br><b>🫁 Current AQI:</b> "
+                        f"{float(us_aqi_shelter):.0f} "
+                        f"(PM2.5: {float(pm25_shelter):.1f} µg/m³)"
+                    )
+                else:
+                    aqi_html = f"<br><b>🫁 PM2.5:</b> {float(pm25_shelter):.1f} µg/m³"
+                observation_time = s.get("observation_time")
+                if pd.notna(observation_time):
+                    aqi_html += f"<br><small>as of {observation_time}</small>"
+
+            folium.CircleMarker(
+                location=[s["lat"], s["lon"]],
+                radius=6,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.8,
+                weight=1,
+                popup=folium.Popup(
+                    f"<b>{s['name']}</b><br>"
+                    f"{kind}<br>"
+                    f"{s['province']}<br>"
+                    f"Est. capacity: {s['available']}/{s['capacity']}"
+                    f"{aqi_html}",
+                    max_width=260,
+                ),
+                tooltip=s["name"],
+            ).add_to(shelter_cluster)
+
+        # ---------------------------------------------------------------
+        # NASA FIRMS — confirmed active fires (satellite-observed, not predicted)
+        # ---------------------------------------------------------------
+        fires_df, fires_status = fetch_active_fires()
+        if fires_status == "ok" and not fires_df.empty:
+            fires_fg = folium.FeatureGroup(name="🔥 Confirmed fires (NASA FIRMS, live)", show=True)
+            for _, f in fires_df.iterrows():
+                confidence = f.get("confidence", "n/a")
+                folium.Marker(
+                    location=[f["latitude"], f["longitude"]],
+                    icon=folium.Icon(color="orange", icon="fire", prefix="fa"),
+                    tooltip=f"Confirmed fire · {f.get('acq_date', '')} {f.get('acq_time', '')}",
+                    popup=folium.Popup(
+                        f"<b>🔥 Confirmed active fire</b><br>"
+                        f"Satellite-detected (NASA FIRMS)<br>"
+                        f"Date: {f.get('acq_date', 'n/a')} {f.get('acq_time', 'n/a')} UTC<br>"
+                        f"Satellite: {f.get('satellite', 'n/a')}<br>"
+                        f"Confidence: {confidence}<br>"
+                        f"Fire radiative power: {f.get('frp', 'n/a')} MW",
+                        max_width=260,
+                    ),
+                ).add_to(fires_fg)
+            fires_fg.add_to(m)
+
+        # ---------------------------------------------------------------
+        # Citizen-reported fires (crowd-sourced via USSD "Report a fire")
+        # ---------------------------------------------------------------
+        reports_df, reports_status = fetch_fire_reports(region_id)
+        if reports_status == "ok" and not reports_df.empty:
+            reports_fg = folium.FeatureGroup(name="📢 Citizen fire reports (last 72h)", show=True)
+            for _, rep in reports_df.iterrows():
+                folium.Marker(
+                    location=[rep["lat"], rep["lon"]],
+                    icon=folium.Icon(color="darkred", icon="bullhorn", prefix="fa"),
+                    tooltip=f"Citizen report · {rep.get('province', '')}",
+                    popup=folium.Popup(
+                        f"<b>📢 Citizen-reported fire</b><br>"
+                        f"Province: {rep.get('province', 'n/a')}<br>"
+                        f"Reported: {rep.get('reported_at_utc', 'n/a')} UTC<br>"
+                        f"<small>Approximate location (province reference point — USSD "
+                        f"callers have no GPS), not a precise pin.</small>",
+                        max_width=260,
+                    ),
+                ).add_to(reports_fg)
+            reports_fg.add_to(m)
+
+        # ---------------------------------------------------------------
+        # Evacuation assistance requests (elderly/disabled needing help)
+        # ---------------------------------------------------------------
+        assist_df, assist_status = fetch_assistance_requests(region_id)
+        if assist_status == "ok" and not assist_df.empty:
+            assist_fg = folium.FeatureGroup(name="♿ Evacuation assistance needed (last 72h)", show=True)
+            for _, req in assist_df.iterrows():
+                folium.Marker(
+                    location=[req["lat"], req["lon"]],
+                    icon=folium.Icon(color="purple", icon="wheelchair", prefix="fa"),
+                    tooltip=f"Assistance needed · {req.get('province', '')}",
+                    popup=folium.Popup(
+                        f"<b>♿ Evacuation assistance requested</b><br>"
+                        f"Province: {req.get('province', 'n/a')}<br>"
+                        f"Requested: {req.get('requested_at_utc', 'n/a')} UTC<br>"
+                        f"Contact: {req.get('phone_number', 'n/a')}<br>"
+                        f"<small>Approximate location (province reference point — USSD "
+                        f"callers have no GPS), not a precise pin.</small>",
+                        max_width=260,
+                    ),
+                ).add_to(assist_fg)
+            assist_fg.add_to(m)
+
+        # Route from the selected zone (if any) to its nearest shelter. Uses the
+        # PREVIOUS click's selection from session_state — this run's own click
+        # (if any) is only known after st_folium returns further below, so the
+        # click handler triggers an immediate rerun to make the route appear
+        # right away instead of one interaction later.
+        _sel = st.session_state.get("tab1_selected_zone")
+        if _sel and _sel.get("shelter_lat") is not None:
+            _route_mode = st.session_state.get("tab1_route_mode", "foot")
+            _route_latlon, _route_dist_km, _route_dur_min = fetch_route(
+                _sel["lat"], _sel["lon"], _sel["shelter_lat"], _sel["shelter_lon"], profile=_route_mode
+            )
+            if _route_latlon:
+                _mode_label = "walking" if _route_mode == "foot" else "driving"
+                folium.PolyLine(
+                    _route_latlon, color="#1976d2", weight=5, opacity=0.85,
+                    tooltip=f"{_route_dist_km:.1f} km · ~{_route_dur_min:.0f} min ({_mode_label})",
+                ).add_to(m)
+
+                # OSRM snaps the start/end to the nearest road IT knows about —
+                # in remote areas with incomplete OpenStreetMap road coverage,
+                # that snapped point can be a real gap away from the actual
+                # zone/shelter location. Close that visual gap with a dashed
+                # line so it's clear which part is a real mapped road vs. an
+                # off-road estimate, instead of the line just looking "cut off".
+                def _gap_km(lat1, lon1, lat2, lon2):
+                    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+                    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+                    return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+                _route_start, _route_end = _route_latlon[0], _route_latlon[-1]
+                _start_gap = _gap_km(_route_start[0], _route_start[1], _sel["lat"], _sel["lon"])
+                _end_gap = _gap_km(_route_end[0], _route_end[1], _sel["shelter_lat"], _sel["shelter_lon"])
+                if _start_gap > 0.05:
+                    folium.PolyLine(
+                        [[_sel["lat"], _sel["lon"]], _route_start],
+                        color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                        tooltip=f"Off-road (~{_start_gap:.1f} km) — no mapped road here, straight-line estimate",
+                    ).add_to(m)
+                if _end_gap > 0.05:
+                    folium.PolyLine(
+                        [_route_end, [_sel["shelter_lat"], _sel["shelter_lon"]]],
+                        color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                        tooltip=f"Off-road (~{_end_gap:.1f} km) — no mapped road here, straight-line estimate",
+                    ).add_to(m)
+
+                folium.Marker(
+                    [_sel["lat"], _sel["lon"]],
+                    icon=folium.Icon(color="red", icon="fire", prefix="fa"),
+                    tooltip="Selected zone",
+                ).add_to(m)
+                folium.Marker(
+                    [_sel["shelter_lat"], _sel["shelter_lon"]],
+                    icon=folium.Icon(color="green", icon="home", prefix="fa"),
+                    tooltip=_sel.get("shelter_name") or "Nearest shelter",
+                ).add_to(m)
+                st.session_state["tab1_route_info"] = {
+                    "distance_km": _route_dist_km, "duration_min": _route_dur_min, "mode": _route_mode,
+                }
             else:
-                st.session_state.tab1_pop_estimate = pop_count
-                st.info(f"👥 Approximately **{pop_count:,.0f} people** live within ~28×28 km around this zone "
-                        f"(WorldPop 2020 estimate — the most recent stable, complete dataset available).")
+                st.session_state["tab1_route_info"] = None
 
-        st.markdown("**📄 Offline report**")
-        pdf_bytes = build_area_report_pdf(
-            zone, shelters_all, fires_df if fires_status == "ok" else pd.DataFrame(),
-            pop_estimate=st.session_state.get("tab1_pop_estimate"),
-        )
-        st.download_button(
-            "📄 Download area report (PDF)", data=pdf_bytes,
-            file_name=f"phoenix_area_report_{zone['lat']:.3f}_{zone['lon']:.3f}.pdf",
-            mime="application/pdf", key="tab1_pdf_download",
-        )
-        st.caption("For field teams heading somewhere without internet access — risk, air quality, "
-                   "nearest shelter, and nearby confirmed fires, all on one printable page.")
+        folium.LayerControl(position="topleft", collapsed=False).add_to(m)
 
-        if st.button("✕ Clear selection", key="tab1_clear_zone"):
+        if len(shelters) > max_markers:
+            st.caption(
+                f"Showing the {max_markers} largest-capacity locations "
+                f"out of {len(shelters)} matching your filters."
+            )
+
+        map_data = st_folium(
+            m, use_container_width=True, height=550,
+            returned_objects=["last_active_drawing"],
+        )
+
+        if fires_status == "no_key":
+            st.caption("🔥 **Confirmed fires (NASA FIRMS)** layer needs a free API key — add `FIRMS_MAP_KEY` "
+                       "to Streamlit secrets (get one at https://firms.modaps.eosdis.nasa.gov/api/map_key/) "
+                       "to see satellite-confirmed fires alongside the predicted risk zones.")
+        elif fires_status == "fetch_failed":
+            st.caption("🔥 Couldn't reach NASA FIRMS just now (network hiccup) — confirmed-fire markers are "
+                       "temporarily unavailable. Predicted risk zones above are unaffected.")
+
+        # ---------------------------------------------------------------
+        # Zone selection (click a risk zone on the map above)
+        # ---------------------------------------------------------------
+        if "tab1_selected_zone" not in st.session_state:
             st.session_state.tab1_selected_zone = None
-            st.session_state.tab1_route_info = None
-            st.session_state.tab1_pop_estimate = None
-            st.session_state.tab1_fwi_result = None
-            st.rerun()
-    else:
-        st.caption("💡 Click a risk zone on the map to select it, see the route to its nearest shelter, "
-                   "and send a targeted alert for that exact spot.")
+        if "tab1_route_mode" not in st.session_state:
+            st.session_state.tab1_route_mode = "foot"
+        if "tab1_last_click_key" not in st.session_state:
+            st.session_state.tab1_last_click_key = None
 
-    # ---------------------------------------------------------------
-    # Nearest shelter & hospital table (for at-risk zones)
-    # ---------------------------------------------------------------
-    st.subheader("🏥 Nearest Shelter & Hospital for At-Risk Zones")
+        clicked = map_data.get("last_active_drawing") if map_data else None
+        if clicked and clicked.get("geometry", {}).get("type") == "Point":
+            lon_c, lat_c = clicked["geometry"]["coordinates"]
+            click_key = (round(lat_c, 6), round(lon_c, 6))
+            props = clicked.get("properties", {})
+            # Only act on risk-zone features (ignore shelter markers), and only
+            # on a NEW click — st_folium keeps returning the same last click on
+            # every rerun, and without this guard the st.rerun() below (which
+            # makes the route appear immediately) would loop forever.
+            if props.get("risk_level") is not None and click_key != st.session_state.tab1_last_click_key:
+                st.session_state.tab1_last_click_key = click_key
+                shelter_pool = shelters_all[shelters_all["is_shelter"]]
+                nearest = nearest_facility([lat_c], [lon_c], shelter_pool)
+                shelter_name = nearest.iloc[0]["name"] if not nearest.empty else None
+                shelter_dist = nearest.iloc[0]["distance_km"] if not nearest.empty else None
+                shelter_lat = float(nearest.iloc[0]["lat"]) if not nearest.empty else None
+                shelter_lon = float(nearest.iloc[0]["lon"]) if not nearest.empty else None
+                st.session_state.tab1_selected_zone = {
+                    "lat": lat_c, "lon": lon_c,
+                    "risk_level": props.get("risk_level"),
+                    "fire_probability_pct": props.get("fire_probability_pct"),
+                    "pm2_5": props.get("pm2_5"),
+                    "health_level": props.get("health_level"),
+                    "shelter_name": shelter_name,
+                    "shelter_dist": shelter_dist,
+                    "shelter_lat": shelter_lat,
+                    "shelter_lon": shelter_lon,
+                }
+                st.rerun()  # redraw the map now, with the route included
 
-    at_risk = res_df[res_df["risk_level"].isin(["High", "Medium"])].copy()
+        zone = st.session_state.tab1_selected_zone
+        if zone:
+            st.markdown("### 📍 Selected Zone")
+            zc1, zc2, zc3 = st.columns(3)
+            zc1.metric("Risk Level", zone["risk_level"] or "N/A")
+            zc2.metric("Fire Probability",
+                       f"{zone['fire_probability_pct']}%" if zone["fire_probability_pct"] is not None else "N/A")
+            aqi_label = (f"{zone['pm2_5']:.0f} µg/m³ ({zone['health_level']})"
+                         if zone["pm2_5"] is not None else "No live data")
+            zc3.metric("Air Quality (PM2.5)", aqi_label)
+            if zone["shelter_name"]:
+                st.caption(f"🏠 Nearest shelter: **{zone['shelter_name']}** ({zone['shelter_dist']:.1f} km away, straight-line)")
 
-    if at_risk.empty:
-        st.info("No Medium/High risk zones for the selected date — nothing to match to shelters right now.")
-    else:
-        shelters_pool = shelters_all[shelters_all["is_shelter"]]
-        hospitals_pool = shelters_all[shelters_all["category"] == "health_facility"]
+                mode_label = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab1_route_mode_radio")
+                new_mode = "foot" if "Walking" in mode_label else "driving"
+                if new_mode != st.session_state.tab1_route_mode:
+                    st.session_state.tab1_route_mode = new_mode
+                    st.rerun()
 
-        nearest_shelter = nearest_facility(at_risk["LAT"], at_risk["LON"], shelters_pool)
-        nearest_hospital = nearest_facility(at_risk["LAT"], at_risk["LON"], hospitals_pool)
+                route_info = st.session_state.get("tab1_route_info")
+                if route_info:
+                    mode_txt = "walking" if route_info["mode"] == "foot" else "driving"
+                    est_note = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
+                        if route_info["mode"] == "foot" else ""
+                    st.success(f"🛣️ Road route: **{route_info['distance_km']:.1f} km**, "
+                               f"~**{route_info['duration_min']:.0f} min** ({mode_txt}){est_note} — shown on the map above.")
+                else:
+                    st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
+                               "showing straight-line distance only.")
+            else:
+                st.caption("🏠 No nearby shelter found.")
 
-        table = pd.DataFrame({
-            "Risk": at_risk["risk_level"].values,
-            "Fire Probability": (at_risk["fire_probability"] * 100).round(1).astype(str).values,
-            "Zone Lat": at_risk["LAT"].round(3).values,
-            "Zone Lon": at_risk["LON"].round(3).values,
-            "Nearest Shelter": nearest_shelter["name"].values,
-            "Shelter Dist (km)": nearest_shelter["distance_km"].round(1).values,
-            "Shelter Avail/Cap": [
-                f"{a}/{c}" if pd.notna(a) else "—"
-                for a, c in zip(nearest_shelter["available"], nearest_shelter["capacity"])
-            ],
-            "Accessible? (♿/🏢/⚕️)": [
-                _acc_icon(wc, "♿") + _acc_icon(gf, "🏢") + _acc_icon(med, "⚕️")
-                for wc, gf, med in zip(
-                    nearest_shelter.get("wheelchair_accessible", pd.Series([None] * len(nearest_shelter))),
-                    nearest_shelter.get("ground_floor", pd.Series([None] * len(nearest_shelter))),
-                    nearest_shelter.get("medical_staff_onsite", pd.Series([None] * len(nearest_shelter))),
-                )
-            ],
-            "Nearest Hospital": nearest_hospital["name"].values,
-            "Hospital Dist (km)": nearest_hospital["distance_km"].round(1).values,
-        })
-        table["Fire Probability"] = table["Fire Probability"] + "%"
-        table = table.sort_values(["Risk", "Shelter Dist (km)"], ascending=[True, True])
+            st.markdown("**🔬 Cross-check: Canadian Fire Weather Index**")
+            if st.button("Calculate real FWI (independent standard)", key="tab1_fwi_btn"):
+                with st.spinner("Running the Canadian FWI System over the full historical record..."):
+                    try:
+                        fwi_resp = requests.get(f"{API_BASE_URL}/fwi",
+                                                 params={"lat": zone["lat"], "lon": zone["lon"], "region": region_id},
+                                                 timeout=30)
+                        fwi_resp.raise_for_status()
+                        st.session_state.tab1_fwi_result = fwi_resp.json()
+                    except Exception as e:
+                        st.session_state.tab1_fwi_result = None
+                        st.warning(f"Couldn't compute FWI: {e}")
+            fwi_result = st.session_state.get("tab1_fwi_result")
+            if fwi_result:
+                fc1, fc2, fc3 = st.columns(3)
+                fc1.metric("FWI (danger)", f"{fwi_result['fwi']} · {fwi_result['danger_class']}")
+                fc2.metric("FFMC", fwi_result["ffmc"])
+                fc3.metric("BUI", fwi_result["bui"])
+                st.caption(f"As of {fwi_result['as_of_date']} — an internationally-used, independently "
+                           f"validated fire-danger standard (Van Wagner 1987), run separately from the ML "
+                           f"model as a cross-check, not a replacement.")
 
-        st.dataframe(table, use_container_width=True, hide_index=True)
-        st.caption(
-            "Shows Medium/High risk zones only, matched to the closest evacuee shelter "
-            "(school or place of worship) and closest health facility by straight-line distance. "
-            "Distances are approximate (haversine), not driving distance. "
-            "**Accessible column**: ♿ wheelchair accessible, 🏢 ground floor, ⚕️ medical staff on-site "
-            "— ✗ means staff reported 'no', ❓ means not yet reported (see the update form below)."
-        )
+            st.markdown("**👥 Affected population**")
+            if st.button("Estimate population in this area (WorldPop)", key="tab1_pop_btn"):
+                with st.spinner("Querying WorldPop (can take up to ~1 minute — their server is sometimes slow)..."):
+                    pop_count, pop_error = fetch_population_estimate(zone["lat"], zone["lon"])
+                if pop_error:
+                    st.warning(f"Couldn't get a population estimate: {pop_error}")
+                    st.session_state.tab1_pop_estimate = None
+                else:
+                    st.session_state.tab1_pop_estimate = pop_count
+                    st.info(f"👥 Approximately **{pop_count:,.0f} people** live within ~28×28 km around this zone "
+                            f"(WorldPop 2020 estimate — the most recent stable, complete dataset available).")
 
-    st.markdown("---")
-
-    # ---------------------------------------------------------------
-    # Update shelter availability (for shelter staff)
-    # ---------------------------------------------------------------
-    with st.expander("🏠 Update Shelter Availability (for shelter staff)"):
-        st.caption("If you manage a shelter, update how many spots are currently open so evacuees "
-                   "aren't directed to a shelter that's already full.")
-        shelter_options = shelters_all[shelters_all["is_shelter"]].sort_values("name")
-        shelter_choice = st.selectbox(
-            "Shelter", shelter_options["name"],
-            key="shelter_update_choice",
-        )
-        chosen = shelter_options[shelter_options["name"] == shelter_choice].iloc[0]
-        new_available = st.number_input(
-            "Currently available spots", min_value=0, max_value=int(chosen["capacity"]),
-            value=int(chosen["available"]), key="shelter_update_value",
-        )
-
-        update_accessibility = st.checkbox(
-            "Also update accessibility info (for elderly/disabled evacuees)",
-            key="shelter_update_acc_toggle",
-        )
-        payload = {"available": int(new_available)}
-        if update_accessibility:
-            st.caption("Only check a box if you're certain — leave unchecked if unsure rather than guessing.")
-            acc_col1, acc_col2, acc_col3 = st.columns(3)
-            payload["wheelchair_accessible"] = acc_col1.checkbox(
-                "♿ Wheelchair accessible", value=(chosen.get("wheelchair_accessible") is True),
-                key="shelter_update_wheelchair",
+            st.markdown("**📄 Offline report**")
+            pdf_bytes = build_area_report_pdf(
+                zone, shelters_all, fires_df if fires_status == "ok" else pd.DataFrame(),
+                pop_estimate=st.session_state.get("tab1_pop_estimate"),
             )
-            payload["ground_floor"] = acc_col2.checkbox(
-                "🏢 Ground floor", value=(chosen.get("ground_floor") is True),
-                key="shelter_update_ground_floor",
+            st.download_button(
+                "📄 Download area report (PDF)", data=pdf_bytes,
+                file_name=f"phoenix_area_report_{zone['lat']:.3f}_{zone['lon']:.3f}.pdf",
+                mime="application/pdf", key="tab1_pdf_download",
             )
-            payload["medical_staff_onsite"] = acc_col3.checkbox(
-                "⚕️ Medical staff on-site", value=(chosen.get("medical_staff_onsite") is True),
-                key="shelter_update_medical",
-            )
+            st.caption("For field teams heading somewhere without internet access — risk, air quality, "
+                       "nearest shelter, and nearby confirmed fires, all on one printable page.")
 
-        if st.button("Update availability", key="shelter_update_btn"):
-            try:
-                resp = requests.patch(
-                    f"{API_BASE_URL}/shelters/{chosen['osm_id']}/availability",
-                    json=payload, timeout=10,
-                )
-                resp.raise_for_status()
-                st.success(f"✅ Updated {shelter_choice}: {new_available}/{int(chosen['capacity'])} spots available.")
-                st.cache_data.clear()  # so the map/table reflect the change on next load
-            except Exception as e:
-                st.error(f"Failed to update: {e}")
-        st.caption("⚠️ Updates apply to the live server for now — they're overwritten by the next "
-                   "scheduled data refresh unless also saved back to the CSV in the repo.")
-
-    st.markdown("---")
-
-    # ---------------------------------------------------------------
-    # Was the forecast right? — spot-check predictions against confirmed fires
-    # ---------------------------------------------------------------
-    st.subheader("📊 Was the Forecast Right?")
-    st.caption("Compares NASA FIRMS confirmed fire detections (last 2 days) against what PHOENIX "
-               "predicted for the nearest grid cell in the 1-3 days before each fire was observed.")
-
-    if fires_status != "ok" or fires_df.empty:
-        st.info("No confirmed fires in the last 2 days to validate against yet.")
-    else:
-        _grid_points = climate[["LAT", "LON"]].drop_duplicates().reset_index(drop=True)
-        _validation_rows = []
-        for _, _fire in fires_df.iterrows():
-            f_lat, f_lon = _fire["latitude"], _fire["longitude"]
-            try:
-                acq_date = pd.to_datetime(_fire["acq_date"])
-            except Exception:
-                continue
-            _dists = ((_grid_points["LAT"] - f_lat) ** 2 + (_grid_points["LON"] - f_lon) ** 2) ** 0.5
-            g_lat, g_lon = _grid_points.loc[_dists.idxmin(), ["LAT", "LON"]]
-
-            was_flagged, checked_any = False, False
-            for days_before in (1, 2, 3):
-                check_date = acq_date - pd.Timedelta(days=days_before)
-                row = climate[(climate["LAT"] == g_lat) & (climate["LON"] == g_lon)
-                               & (climate["date"] == check_date)]
-                if row.empty or pd.isna(row.iloc[0]["T2M_MAX"]):
-                    continue
-                row = row.iloc[0]
-                checked_any = True
-                pred = predict_fire_risk_for_region(
-                    region_id, lat=g_lat, lon=g_lon, doy=check_date.dayofyear,
-                    t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
-                    rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
-                )
-                if pred["risk_level"] in ("High", "Medium"):
-                    was_flagged = True
-                    break
-
-            _validation_rows.append({
-                "Fire date": _fire.get("acq_date"),
-                "Lat": round(f_lat, 3), "Lon": round(f_lon, 3),
-                "Nearest grid cell": f"{g_lat:.2f}, {g_lon:.2f}",
-                "Flagged High/Medium in prior 1-3 days?": (
-                    "✅ Yes" if was_flagged else ("❓ No prior data" if not checked_any else "❌ No")
-                ),
-            })
-
-        if _validation_rows:
-            val_df = pd.DataFrame(_validation_rows)
-            checked_count = (val_df["Flagged High/Medium in prior 1-3 days?"] != "❓ No prior data").sum()
-            flagged_count = (val_df["Flagged High/Medium in prior 1-3 days?"] == "✅ Yes").sum()
-            if checked_count > 0:
-                st.metric("Prediction hit rate",
-                          f"{flagged_count}/{checked_count} confirmed fires were in a zone flagged "
-                          f"High/Medium risk in the prior 1-3 days")
-            st.dataframe(val_df, use_container_width=True, hide_index=True)
-            st.caption("This is a simple spot-check, not a rigorous accuracy metric — it only covers "
-                       "the last 2 days of confirmed fires, and doesn't account for zones the model "
-                       "correctly flagged where no fire happened to be detected by satellite (true "
-                       "negatives aren't visible here).")
+            if st.button("✕ Clear selection", key="tab1_clear_zone"):
+                st.session_state.tab1_selected_zone = None
+                st.session_state.tab1_route_info = None
+                st.session_state.tab1_pop_estimate = None
+                st.session_state.tab1_fwi_result = None
+                st.rerun()
         else:
-            st.info("Not enough overlapping data yet to validate.")
+            st.caption("💡 Click a risk zone on the map to select it, see the route to its nearest shelter, "
+                       "and send a targeted alert for that exact spot.")
 
-    st.markdown("---")
+    with subtab1b:
+        # ---------------------------------------------------------------
+        # Nearest shelter & hospital table (for at-risk zones)
+        # ---------------------------------------------------------------
+        st.subheader("🏥 Nearest Shelter & Hospital for At-Risk Zones")
 
-    # ---------------------------------------------------------------
-    # Seasonal fire-risk analysis
-    # ---------------------------------------------------------------
-    st.subheader("📈 Seasonal Fire Risk Analysis")
-    st.caption("Typical fire-risk probability by month, based on the historical average weather for "
-               "each month across all years in the dataset (region-wide average location). Useful for "
-               "advance planning ahead of the fire season — no extra data source needed, this reuses "
-               "the climate data already collected.")
+        at_risk = res_df[res_df["risk_level"].isin(["High", "Medium"])].copy()
 
-    _monthly = climate.copy()
-    _monthly["month"] = _monthly["date"].dt.month
-    _monthly_avg = _monthly.groupby("month")[["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]].mean().dropna()
+        if at_risk.empty:
+            st.info("No Medium/High risk zones for the selected date — nothing to match to shelters right now.")
+        else:
+            shelters_pool = shelters_all[shelters_all["is_shelter"]]
+            hospitals_pool = shelters_all[shelters_all["category"] == "health_facility"]
 
-    if not _monthly_avg.empty:
-        _month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        _region_lat, _region_lon = climate["LAT"].mean(), climate["LON"].mean()
-        _season_rows = []
-        for month, row in _monthly_avg.iterrows():
-            representative_doy = pd.Timestamp(2023, int(month), 15).dayofyear  # any non-leap year, day 15
-            pred = predict_fire_risk_for_region(
-                region_id, lat=_region_lat, lon=_region_lon, doy=representative_doy,
-                t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"], rh2m=row["RH2M"],
-                ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
-            )
-            _season_rows.append({
-                "Month": _month_names[int(month) - 1], "month_num": int(month),
-                "Typical Fire Probability (%)": round(pred["fire_probability"] * 100, 1),
+            nearest_shelter = nearest_facility(at_risk["LAT"], at_risk["LON"], shelters_pool)
+            nearest_hospital = nearest_facility(at_risk["LAT"], at_risk["LON"], hospitals_pool)
+
+            table = pd.DataFrame({
+                "Risk": at_risk["risk_level"].values,
+                "Fire Probability": (at_risk["fire_probability"] * 100).round(1).astype(str).values,
+                "Zone Lat": at_risk["LAT"].round(3).values,
+                "Zone Lon": at_risk["LON"].round(3).values,
+                "Nearest Shelter": nearest_shelter["name"].values,
+                "Shelter Dist (km)": nearest_shelter["distance_km"].round(1).values,
+                "Shelter Avail/Cap": [
+                    f"{a}/{c}" if pd.notna(a) else "—"
+                    for a, c in zip(nearest_shelter["available"], nearest_shelter["capacity"])
+                ],
+                "Accessible? (♿/🏢/⚕️)": [
+                    _acc_icon(wc, "♿") + _acc_icon(gf, "🏢") + _acc_icon(med, "⚕️")
+                    for wc, gf, med in zip(
+                        nearest_shelter.get("wheelchair_accessible", pd.Series([None] * len(nearest_shelter))),
+                        nearest_shelter.get("ground_floor", pd.Series([None] * len(nearest_shelter))),
+                        nearest_shelter.get("medical_staff_onsite", pd.Series([None] * len(nearest_shelter))),
+                    )
+                ],
+                "Nearest Hospital": nearest_hospital["name"].values,
+                "Hospital Dist (km)": nearest_hospital["distance_km"].round(1).values,
             })
-        _season_df = pd.DataFrame(_season_rows).sort_values("month_num")
+            table["Fire Probability"] = table["Fire Probability"] + "%"
+            table = table.sort_values(["Risk", "Shelter Dist (km)"], ascending=[True, True])
 
-        fig = px.bar(
-            _season_df, x="Month", y="Typical Fire Probability (%)",
-            title="Typical Fire Risk by Month (region-wide average, all years)",
-            color="Typical Fire Probability (%)",
-            color_continuous_scale=["#27ae60", "#f39c12", "#e74c3c"],
-        )
-        fig.update_layout(showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.caption(
+                "Shows Medium/High risk zones only, matched to the closest evacuee shelter "
+                "(school or place of worship) and closest health facility by straight-line distance. "
+                "Distances are approximate (haversine), not driving distance. "
+                "**Accessible column**: ♿ wheelchair accessible, 🏢 ground floor, ⚕️ medical staff on-site "
+                "— ✗ means staff reported 'no', ❓ means not yet reported (see the update form below)."
+            )
 
-        peak_month = _season_df.loc[_season_df["Typical Fire Probability (%)"].idxmax(), "Month"]
-        st.caption(f"📌 Historically, **{peak_month}** shows the highest typical fire risk in this "
-                   f"region — useful for planning resources ahead of the season.")
-    else:
-        st.info("Not enough historical data yet to compute a seasonal pattern.")
+        st.markdown("---")
+
+        # ---------------------------------------------------------------
+        # Update shelter availability (for shelter staff)
+        # ---------------------------------------------------------------
+        with st.expander("🏠 Update Shelter Availability (for shelter staff)"):
+            st.caption("If you manage a shelter, update how many spots are currently open so evacuees "
+                       "aren't directed to a shelter that's already full.")
+            shelter_options = shelters_all[shelters_all["is_shelter"]].sort_values("name")
+            shelter_choice = st.selectbox(
+                "Shelter", shelter_options["name"],
+                key="shelter_update_choice",
+            )
+            chosen = shelter_options[shelter_options["name"] == shelter_choice].iloc[0]
+            new_available = st.number_input(
+                "Currently available spots", min_value=0, max_value=int(chosen["capacity"]),
+                value=int(chosen["available"]), key="shelter_update_value",
+            )
+
+            update_accessibility = st.checkbox(
+                "Also update accessibility info (for elderly/disabled evacuees)",
+                key="shelter_update_acc_toggle",
+            )
+            payload = {"available": int(new_available)}
+            if update_accessibility:
+                st.caption("Only check a box if you're certain — leave unchecked if unsure rather than guessing.")
+                acc_col1, acc_col2, acc_col3 = st.columns(3)
+                payload["wheelchair_accessible"] = acc_col1.checkbox(
+                    "♿ Wheelchair accessible", value=(chosen.get("wheelchair_accessible") is True),
+                    key="shelter_update_wheelchair",
+                )
+                payload["ground_floor"] = acc_col2.checkbox(
+                    "🏢 Ground floor", value=(chosen.get("ground_floor") is True),
+                    key="shelter_update_ground_floor",
+                )
+                payload["medical_staff_onsite"] = acc_col3.checkbox(
+                    "⚕️ Medical staff on-site", value=(chosen.get("medical_staff_onsite") is True),
+                    key="shelter_update_medical",
+                )
+
+            if st.button("Update availability", key="shelter_update_btn"):
+                try:
+                    resp = requests.patch(
+                        f"{API_BASE_URL}/shelters/{chosen['osm_id']}/availability",
+                        json=payload, timeout=10,
+                    )
+                    resp.raise_for_status()
+                    st.success(f"✅ Updated {shelter_choice}: {new_available}/{int(chosen['capacity'])} spots available.")
+                    st.cache_data.clear()  # so the map/table reflect the change on next load
+                except Exception as e:
+                    st.error(f"Failed to update: {e}")
+            st.caption("⚠️ Updates apply to the live server for now — they're overwritten by the next "
+                       "scheduled data refresh unless also saved back to the CSV in the repo.")
+
+
+    with subtab1c:
+        # ---------------------------------------------------------------
+        # Was the forecast right? — spot-check predictions against confirmed fires
+        # ---------------------------------------------------------------
+        st.subheader("📊 Was the Forecast Right?")
+        st.caption("Compares NASA FIRMS confirmed fire detections (last 2 days) against what PHOENIX "
+                   "predicted for the nearest grid cell in the 1-3 days before each fire was observed.")
+
+        if fires_status != "ok" or fires_df.empty:
+            st.info("No confirmed fires in the last 2 days to validate against yet.")
+        else:
+            _grid_points = climate[["LAT", "LON"]].drop_duplicates().reset_index(drop=True)
+            _validation_rows = []
+            for _, _fire in fires_df.iterrows():
+                f_lat, f_lon = _fire["latitude"], _fire["longitude"]
+                try:
+                    acq_date = pd.to_datetime(_fire["acq_date"])
+                except Exception:
+                    continue
+                _dists = ((_grid_points["LAT"] - f_lat) ** 2 + (_grid_points["LON"] - f_lon) ** 2) ** 0.5
+                g_lat, g_lon = _grid_points.loc[_dists.idxmin(), ["LAT", "LON"]]
+
+                was_flagged, checked_any = False, False
+                for days_before in (1, 2, 3):
+                    check_date = acq_date - pd.Timedelta(days=days_before)
+                    row = climate[(climate["LAT"] == g_lat) & (climate["LON"] == g_lon)
+                                   & (climate["date"] == check_date)]
+                    if row.empty or pd.isna(row.iloc[0]["T2M_MAX"]):
+                        continue
+                    row = row.iloc[0]
+                    checked_any = True
+                    pred = predict_fire_risk_for_region(
+                        region_id, lat=g_lat, lon=g_lon, doy=check_date.dayofyear,
+                        t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"],
+                        rh2m=row["RH2M"], ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+                    )
+                    if pred["risk_level"] in ("High", "Medium"):
+                        was_flagged = True
+                        break
+
+                _validation_rows.append({
+                    "Fire date": _fire.get("acq_date"),
+                    "Lat": round(f_lat, 3), "Lon": round(f_lon, 3),
+                    "Nearest grid cell": f"{g_lat:.2f}, {g_lon:.2f}",
+                    "Flagged High/Medium in prior 1-3 days?": (
+                        "✅ Yes" if was_flagged else ("❓ No prior data" if not checked_any else "❌ No")
+                    ),
+                })
+
+            if _validation_rows:
+                val_df = pd.DataFrame(_validation_rows)
+                checked_count = (val_df["Flagged High/Medium in prior 1-3 days?"] != "❓ No prior data").sum()
+                flagged_count = (val_df["Flagged High/Medium in prior 1-3 days?"] == "✅ Yes").sum()
+                if checked_count > 0:
+                    st.metric("Prediction hit rate",
+                              f"{flagged_count}/{checked_count} confirmed fires were in a zone flagged "
+                              f"High/Medium risk in the prior 1-3 days")
+                st.dataframe(val_df, use_container_width=True, hide_index=True)
+                st.caption("This is a simple spot-check, not a rigorous accuracy metric — it only covers "
+                           "the last 2 days of confirmed fires, and doesn't account for zones the model "
+                           "correctly flagged where no fire happened to be detected by satellite (true "
+                           "negatives aren't visible here).")
+            else:
+                st.info("Not enough overlapping data yet to validate.")
+
+
+    with subtab1d:
+        # ---------------------------------------------------------------
+        # Seasonal fire-risk analysis
+        # ---------------------------------------------------------------
+        st.subheader("📈 Seasonal Fire Risk Analysis")
+        st.caption("Typical fire-risk probability by month, based on the historical average weather for "
+                   "each month across all years in the dataset (region-wide average location). Useful for "
+                   "advance planning ahead of the fire season — no extra data source needed, this reuses "
+                   "the climate data already collected.")
+
+        _monthly = climate.copy()
+        _monthly["month"] = _monthly["date"].dt.month
+        _monthly_avg = _monthly.groupby("month")[["T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]].mean().dropna()
+
+        if not _monthly_avg.empty:
+            _month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            _region_lat, _region_lon = climate["LAT"].mean(), climate["LON"].mean()
+            _season_rows = []
+            for month, row in _monthly_avg.iterrows():
+                representative_doy = pd.Timestamp(2023, int(month), 15).dayofyear  # any non-leap year, day 15
+                pred = predict_fire_risk_for_region(
+                    region_id, lat=_region_lat, lon=_region_lon, doy=representative_doy,
+                    t2m_max=row["T2M_MAX"], t2m_min=row["T2M_MIN"], rh2m=row["RH2M"],
+                    ws2m=row["WS2M"], prectotcorr=row["PRECTOTCORR"],
+                )
+                _season_rows.append({
+                    "Month": _month_names[int(month) - 1], "month_num": int(month),
+                    "Typical Fire Probability (%)": round(pred["fire_probability"] * 100, 1),
+                })
+            _season_df = pd.DataFrame(_season_rows).sort_values("month_num")
+
+            fig = px.bar(
+                _season_df, x="Month", y="Typical Fire Probability (%)",
+                title="Typical Fire Risk by Month (region-wide average, all years)",
+                color="Typical Fire Probability (%)",
+                color_continuous_scale=["#27ae60", "#f39c12", "#e74c3c"],
+            )
+            fig.update_layout(showlegend=False, coloraxis_showscale=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+            peak_month = _season_df.loc[_season_df["Typical Fire Probability (%)"].idxmax(), "Month"]
+            st.caption(f"📌 Historically, **{peak_month}** shows the highest typical fire risk in this "
+                       f"region — useful for planning resources ahead of the season.")
+        else:
+            st.info("Not enough historical data yet to compute a seasonal pattern.")
 
 # =================================================================
 # TAB 2: Future Prediction (NEW!)
@@ -1794,282 +1800,286 @@ with tab2:
 
     df_future = pd.DataFrame(future_data)
 
-    # Summary Metrics
-    st.markdown("---")
-    st.subheader("📊 Prediction Summary")
+    subtab2a, subtab2b, subtab2c, subtab2d = st.tabs([
+        "🗺️ Map & Prediction", "🏠 Nearest Shelters", "📈 Charts & Data", "📱 Send Alert",
+    ])
 
-    high_risk = df_future[df_future["risk_level"] == "High"]
-    moderate_risk = df_future[df_future["risk_level"] == "Moderate"]
-    low_risk = df_future[df_future["risk_level"] == "Low"]
-    avg_prob = df_future["fire_probability"].mean()
-    max_prob = df_future["fire_probability"].max()
+    with subtab2a:
+        # Summary Metrics
+        st.markdown("---")
+        st.subheader("📊 Prediction Summary")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    with m1:
-        st.metric("🔴 High Risk", len(high_risk), help="Zones with >70% fire probability")
-    with m2:
-        st.metric("🟡 Moderate", len(moderate_risk), help="Zones with 40-70% probability")
-    with m3:
-        st.metric("🟢 Low Risk", len(low_risk), help="Zones with <40% probability")
-    with m4:
-        st.metric("📊 Avg Prob", f"{avg_prob:.1%}")
-    with m5:
-        st.metric("⚠️ Max Prob", f"{max_prob:.1%}")
+        high_risk = df_future[df_future["risk_level"] == "High"]
+        moderate_risk = df_future[df_future["risk_level"] == "Moderate"]
+        low_risk = df_future[df_future["risk_level"] == "Low"]
+        avg_prob = df_future["fire_probability"].mean()
+        max_prob = df_future["fire_probability"].max()
 
-    st.markdown("---")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1:
+            st.metric("🔴 High Risk", len(high_risk), help="Zones with >70% fire probability")
+        with m2:
+            st.metric("🟡 Moderate", len(moderate_risk), help="Zones with 40-70% probability")
+        with m3:
+            st.metric("🟢 Low Risk", len(low_risk), help="Zones with <40% probability")
+        with m4:
+            st.metric("📊 Avg Prob", f"{avg_prob:.1%}")
+        with m5:
+            st.metric("⚠️ Max Prob", f"{max_prob:.1%}")
 
-    # Interactive Map
-    st.subheader("🗺️ Predicted Risk Heatmap")
+        st.markdown("---")
 
-    m_future = folium.Map(
-        location=list(region_cfg["map_center"]),
-        zoom_start=region_cfg["map_zoom"],
-        tiles="OpenStreetMap"
-    )
+        # Interactive Map
+        st.subheader("🗺️ Predicted Risk Heatmap")
 
-    future_features = []
-    for _, row in df_future.iterrows():
-        future_features.append({
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [row["lon"], row["lat"]]},
-            "properties": {
-                "risk_level": row["risk_level"],
-                "fire_probability_pct": f"{row['fire_probability']:.1%}",
-                "t2m_max": round(row["t2m_max"], 1),
-                "rh2m": round(row["rh2m"], 1),
-            },
-        })
-
-    def future_style_function(feature):
-        color = FUTURE_COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
-        return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
-
-    folium.GeoJson(
-        {"type": "FeatureCollection", "features": future_features},
-        name="Predicted risk zones",
-        marker=folium.CircleMarker(radius=12, fill=True),
-        style_function=future_style_function,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
-            aliases=["Risk:", "Fire probability:", "Max temp (°C):", "Humidity (%):"],
-            sticky=True,
-        ),
-        popup=folium.GeoJsonPopup(
-            fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
-            aliases=["⚠️ Risk Level:", "🔥 Probability:", "🌡️ Max Temp:", "💧 Humidity:"],
-            max_width=250,
-        ),
-    ).add_to(m_future)
-
-    legend_html = """
-    <div style="position: fixed; bottom: 50px; left: 50px; z-index: 9999; 
-         background-color: rgba(0,0,0,0.8); padding: 12px; border-radius: 8px; 
-         box-shadow: 2px 2px 10px rgba(0,0,0,0.5); color: white; font-size: 13px;">
-    <b>🔥 Risk Level</b><br>
-    <span style="color: #e74c3c;">●</span> High (>70%)<br>
-    <span style="color: #f39c12;">●</span> Moderate (40-70%)<br>
-    <span style="color: #27ae60;">●</span> Low (<40%)
-    </div>
-    """
-    m_future.get_root().html.add_child(folium.Element(legend_html))
-
-    # Route from the selected zone (if any) to its nearest shelter — same
-    # approach as Tab 1: uses the PREVIOUS click's selection from
-    # session_state, since this run's own click is only known after
-    # st_folium returns below; the click handler triggers an immediate
-    # rerun so the route appears right away.
-    _sel2 = st.session_state.get("tab2_selected_zone")
-    if _sel2 and _sel2.get("shelter_lat") is not None:
-        _route_mode2 = st.session_state.get("tab2_route_mode", "foot")
-        _route_latlon2, _route_dist_km2, _route_dur_min2 = fetch_route(
-            _sel2["lat"], _sel2["lon"], _sel2["shelter_lat"], _sel2["shelter_lon"], profile=_route_mode2
+        m_future = folium.Map(
+            location=list(region_cfg["map_center"]),
+            zoom_start=region_cfg["map_zoom"],
+            tiles="OpenStreetMap"
         )
-        if _route_latlon2:
-            _mode_label2 = "walking" if _route_mode2 == "foot" else "driving"
-            folium.PolyLine(
-                _route_latlon2, color="#1976d2", weight=5, opacity=0.85,
-                tooltip=f"{_route_dist_km2:.1f} km · ~{_route_dur_min2:.0f} min ({_mode_label2})",
-            ).add_to(m_future)
 
-            def _gap_km2(lat1, lon1, lat2, lon2):
-                dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
-                a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-                return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
+        future_features = []
+        for _, row in df_future.iterrows():
+            future_features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [row["lon"], row["lat"]]},
+                "properties": {
+                    "risk_level": row["risk_level"],
+                    "fire_probability_pct": f"{row['fire_probability']:.1%}",
+                    "t2m_max": round(row["t2m_max"], 1),
+                    "rh2m": round(row["rh2m"], 1),
+                },
+            })
 
-            _rstart2, _rend2 = _route_latlon2[0], _route_latlon2[-1]
-            _start_gap2 = _gap_km2(_rstart2[0], _rstart2[1], _sel2["lat"], _sel2["lon"])
-            _end_gap2 = _gap_km2(_rend2[0], _rend2[1], _sel2["shelter_lat"], _sel2["shelter_lon"])
-            if _start_gap2 > 0.05:
+        def future_style_function(feature):
+            color = FUTURE_COLOR_MAP.get(feature["properties"]["risk_level"], "gray")
+            return {"fillColor": color, "color": color, "weight": 2, "fillOpacity": 0.7}
+
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": future_features},
+            name="Predicted risk zones",
+            marker=folium.CircleMarker(radius=12, fill=True),
+            style_function=future_style_function,
+            tooltip=folium.GeoJsonTooltip(
+                fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
+                aliases=["Risk:", "Fire probability:", "Max temp (°C):", "Humidity (%):"],
+                sticky=True,
+            ),
+            popup=folium.GeoJsonPopup(
+                fields=["risk_level", "fire_probability_pct", "t2m_max", "rh2m"],
+                aliases=["⚠️ Risk Level:", "🔥 Probability:", "🌡️ Max Temp:", "💧 Humidity:"],
+                max_width=250,
+            ),
+        ).add_to(m_future)
+
+        legend_html = """
+        <div style="position: fixed; bottom: 50px; left: 50px; z-index: 9999; 
+             background-color: rgba(0,0,0,0.8); padding: 12px; border-radius: 8px; 
+             box-shadow: 2px 2px 10px rgba(0,0,0,0.5); color: white; font-size: 13px;">
+        <b>🔥 Risk Level</b><br>
+        <span style="color: #e74c3c;">●</span> High (>70%)<br>
+        <span style="color: #f39c12;">●</span> Moderate (40-70%)<br>
+        <span style="color: #27ae60;">●</span> Low (<40%)
+        </div>
+        """
+        m_future.get_root().html.add_child(folium.Element(legend_html))
+
+        # Route from the selected zone (if any) to its nearest shelter — same
+        # approach as Tab 1: uses the PREVIOUS click's selection from
+        # session_state, since this run's own click is only known after
+        # st_folium returns below; the click handler triggers an immediate
+        # rerun so the route appears right away.
+        _sel2 = st.session_state.get("tab2_selected_zone")
+        if _sel2 and _sel2.get("shelter_lat") is not None:
+            _route_mode2 = st.session_state.get("tab2_route_mode", "foot")
+            _route_latlon2, _route_dist_km2, _route_dur_min2 = fetch_route(
+                _sel2["lat"], _sel2["lon"], _sel2["shelter_lat"], _sel2["shelter_lon"], profile=_route_mode2
+            )
+            if _route_latlon2:
+                _mode_label2 = "walking" if _route_mode2 == "foot" else "driving"
                 folium.PolyLine(
-                    [[_sel2["lat"], _sel2["lon"]], _rstart2],
-                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
-                    tooltip=f"Off-road (~{_start_gap2:.1f} km) — no mapped road here, straight-line estimate",
-                ).add_to(m_future)
-            if _end_gap2 > 0.05:
-                folium.PolyLine(
-                    [_rend2, [_sel2["shelter_lat"], _sel2["shelter_lon"]]],
-                    color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
-                    tooltip=f"Off-road (~{_end_gap2:.1f} km) — no mapped road here, straight-line estimate",
+                    _route_latlon2, color="#1976d2", weight=5, opacity=0.85,
+                    tooltip=f"{_route_dist_km2:.1f} km · ~{_route_dur_min2:.0f} min ({_mode_label2})",
                 ).add_to(m_future)
 
-            folium.Marker(
-                [_sel2["lat"], _sel2["lon"]],
-                icon=folium.Icon(color="red", icon="fire", prefix="fa"),
-                tooltip="Selected zone",
-            ).add_to(m_future)
-            folium.Marker(
-                [_sel2["shelter_lat"], _sel2["shelter_lon"]],
-                icon=folium.Icon(color="green", icon="home", prefix="fa"),
-                tooltip=_sel2.get("shelter_name") or "Nearest shelter",
-            ).add_to(m_future)
-            st.session_state["tab2_route_info"] = {
-                "distance_km": _route_dist_km2, "duration_min": _route_dur_min2, "mode": _route_mode2,
-            }
-        else:
-            st.session_state["tab2_route_info"] = None
+                def _gap_km2(lat1, lon1, lat2, lon2):
+                    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+                    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+                    return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
 
-    map_data_future = st_folium(
-        m_future, width="100%", height=600,
-        returned_objects=["last_active_drawing"],
-    )
+                _rstart2, _rend2 = _route_latlon2[0], _route_latlon2[-1]
+                _start_gap2 = _gap_km2(_rstart2[0], _rstart2[1], _sel2["lat"], _sel2["lon"])
+                _end_gap2 = _gap_km2(_rend2[0], _rend2[1], _sel2["shelter_lat"], _sel2["shelter_lon"])
+                if _start_gap2 > 0.05:
+                    folium.PolyLine(
+                        [[_sel2["lat"], _sel2["lon"]], _rstart2],
+                        color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                        tooltip=f"Off-road (~{_start_gap2:.1f} km) — no mapped road here, straight-line estimate",
+                    ).add_to(m_future)
+                if _end_gap2 > 0.05:
+                    folium.PolyLine(
+                        [_rend2, [_sel2["shelter_lat"], _sel2["shelter_lon"]]],
+                        color="#1976d2", weight=3, opacity=0.6, dash_array="6,8",
+                        tooltip=f"Off-road (~{_end_gap2:.1f} km) — no mapped road here, straight-line estimate",
+                    ).add_to(m_future)
 
-    # ---------------------------------------------------------------
-    # Zone selection (click a predicted risk zone on the map above)
-    # ---------------------------------------------------------------
-    if "tab2_selected_zone" not in st.session_state:
-        st.session_state.tab2_selected_zone = None
-    if "tab2_route_mode" not in st.session_state:
-        st.session_state.tab2_route_mode = "foot"
-    if "tab2_last_click_key" not in st.session_state:
-        st.session_state.tab2_last_click_key = None
+                folium.Marker(
+                    [_sel2["lat"], _sel2["lon"]],
+                    icon=folium.Icon(color="red", icon="fire", prefix="fa"),
+                    tooltip="Selected zone",
+                ).add_to(m_future)
+                folium.Marker(
+                    [_sel2["shelter_lat"], _sel2["shelter_lon"]],
+                    icon=folium.Icon(color="green", icon="home", prefix="fa"),
+                    tooltip=_sel2.get("shelter_name") or "Nearest shelter",
+                ).add_to(m_future)
+                st.session_state["tab2_route_info"] = {
+                    "distance_km": _route_dist_km2, "duration_min": _route_dur_min2, "mode": _route_mode2,
+                }
+            else:
+                st.session_state["tab2_route_info"] = None
 
-    clicked2 = map_data_future.get("last_active_drawing") if map_data_future else None
-    if clicked2 and clicked2.get("geometry", {}).get("type") == "Point":
-        lon_c2, lat_c2 = clicked2["geometry"]["coordinates"]
-        click_key2 = (round(lat_c2, 6), round(lon_c2, 6))
-        props2 = clicked2.get("properties", {})
-        if props2.get("risk_level") is not None and click_key2 != st.session_state.tab2_last_click_key:
-            st.session_state.tab2_last_click_key = click_key2
-            shelter_pool2 = shelters_all[shelters_all["is_shelter"]]
-            nearest2 = nearest_facility([lat_c2], [lon_c2], shelter_pool2)
-            shelter_name2 = nearest2.iloc[0]["name"] if not nearest2.empty else None
-            shelter_dist2 = nearest2.iloc[0]["distance_km"] if not nearest2.empty else None
-            shelter_lat2 = float(nearest2.iloc[0]["lat"]) if not nearest2.empty else None
-            shelter_lon2 = float(nearest2.iloc[0]["lon"]) if not nearest2.empty else None
-            st.session_state.tab2_selected_zone = {
-                "lat": lat_c2, "lon": lon_c2,
-                "risk_level": props2.get("risk_level"),
-                "fire_probability_pct": props2.get("fire_probability_pct"),
-                "shelter_name": shelter_name2,
-                "shelter_dist": shelter_dist2,
-                "shelter_lat": shelter_lat2,
-                "shelter_lon": shelter_lon2,
-            }
-            st.rerun()
+        map_data_future = st_folium(
+            m_future, width="100%", height=600,
+            returned_objects=["last_active_drawing"],
+        )
 
-    zone2 = st.session_state.tab2_selected_zone
-    if zone2:
-        st.markdown("### 📍 Selected Zone (Forecast)")
-        zc1b, zc2b = st.columns(2)
-        zc1b.metric("Risk Level", zone2["risk_level"] or "N/A")
-        zc2b.metric("Fire Probability", zone2["fire_probability_pct"] or "N/A")
-        if zone2["shelter_name"]:
-            st.caption(f"🏠 Nearest shelter: **{zone2['shelter_name']}** ({zone2['shelter_dist']:.1f} km away, straight-line)")
+        # ---------------------------------------------------------------
+        # Zone selection (click a predicted risk zone on the map above)
+        # ---------------------------------------------------------------
+        if "tab2_selected_zone" not in st.session_state:
+            st.session_state.tab2_selected_zone = None
+        if "tab2_route_mode" not in st.session_state:
+            st.session_state.tab2_route_mode = "foot"
+        if "tab2_last_click_key" not in st.session_state:
+            st.session_state.tab2_last_click_key = None
 
-            mode_label2 = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab2_route_mode_radio")
-            new_mode2 = "foot" if "Walking" in mode_label2 else "driving"
-            if new_mode2 != st.session_state.tab2_route_mode:
-                st.session_state.tab2_route_mode = new_mode2
+        clicked2 = map_data_future.get("last_active_drawing") if map_data_future else None
+        if clicked2 and clicked2.get("geometry", {}).get("type") == "Point":
+            lon_c2, lat_c2 = clicked2["geometry"]["coordinates"]
+            click_key2 = (round(lat_c2, 6), round(lon_c2, 6))
+            props2 = clicked2.get("properties", {})
+            if props2.get("risk_level") is not None and click_key2 != st.session_state.tab2_last_click_key:
+                st.session_state.tab2_last_click_key = click_key2
+                shelter_pool2 = shelters_all[shelters_all["is_shelter"]]
+                nearest2 = nearest_facility([lat_c2], [lon_c2], shelter_pool2)
+                shelter_name2 = nearest2.iloc[0]["name"] if not nearest2.empty else None
+                shelter_dist2 = nearest2.iloc[0]["distance_km"] if not nearest2.empty else None
+                shelter_lat2 = float(nearest2.iloc[0]["lat"]) if not nearest2.empty else None
+                shelter_lon2 = float(nearest2.iloc[0]["lon"]) if not nearest2.empty else None
+                st.session_state.tab2_selected_zone = {
+                    "lat": lat_c2, "lon": lon_c2,
+                    "risk_level": props2.get("risk_level"),
+                    "fire_probability_pct": props2.get("fire_probability_pct"),
+                    "shelter_name": shelter_name2,
+                    "shelter_dist": shelter_dist2,
+                    "shelter_lat": shelter_lat2,
+                    "shelter_lon": shelter_lon2,
+                }
                 st.rerun()
 
-            route_info2 = st.session_state.get("tab2_route_info")
-            if route_info2:
-                mode_txt2 = "walking" if route_info2["mode"] == "foot" else "driving"
-                est_note2 = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
-                    if route_info2["mode"] == "foot" else ""
-                st.success(f"🛣️ Road route: **{route_info2['distance_km']:.1f} km**, "
-                           f"~**{route_info2['duration_min']:.0f} min** ({mode_txt2}){est_note2} — shown on the map above.")
+        zone2 = st.session_state.tab2_selected_zone
+        if zone2:
+            st.markdown("### 📍 Selected Zone (Forecast)")
+            zc1b, zc2b = st.columns(2)
+            zc1b.metric("Risk Level", zone2["risk_level"] or "N/A")
+            zc2b.metric("Fire Probability", zone2["fire_probability_pct"] or "N/A")
+            if zone2["shelter_name"]:
+                st.caption(f"🏠 Nearest shelter: **{zone2['shelter_name']}** ({zone2['shelter_dist']:.1f} km away, straight-line)")
+
+                mode_label2 = st.radio("Route by", ["🚶 Walking", "🚗 Driving"], horizontal=True, key="tab2_route_mode_radio")
+                new_mode2 = "foot" if "Walking" in mode_label2 else "driving"
+                if new_mode2 != st.session_state.tab2_route_mode:
+                    st.session_state.tab2_route_mode = new_mode2
+                    st.rerun()
+
+                route_info2 = st.session_state.get("tab2_route_info")
+                if route_info2:
+                    mode_txt2 = "walking" if route_info2["mode"] == "foot" else "driving"
+                    est_note2 = " (estimated at 4.5 km/h — the routing service only provides real driving times)" \
+                        if route_info2["mode"] == "foot" else ""
+                    st.success(f"🛣️ Road route: **{route_info2['distance_km']:.1f} km**, "
+                               f"~**{route_info2['duration_min']:.0f} min** ({mode_txt2}){est_note2} — shown on the map above.")
+                else:
+                    st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
+                               "showing straight-line distance only.")
             else:
-                st.caption("⚠️ Road route unavailable right now (routing service may be busy) — "
-                           "showing straight-line distance only.")
+                st.caption("🏠 No nearby shelter found.")
+            if st.button("✕ Clear selection", key="tab2_clear_zone"):
+                st.session_state.tab2_selected_zone = None
+                st.session_state.tab2_route_info = None
+                st.rerun()
         else:
-            st.caption("🏠 No nearby shelter found.")
-        if st.button("✕ Clear selection", key="tab2_clear_zone"):
-            st.session_state.tab2_selected_zone = None
-            st.session_state.tab2_route_info = None
-            st.rerun()
-    else:
-        st.caption("💡 Click a predicted risk zone on the map to see the route to its nearest shelter.")
+            st.caption("💡 Click a predicted risk zone on the map to see the route to its nearest shelter.")
 
-    st.markdown("---")
 
-    town_choice = st.selectbox("Reference town", list(region_cfg["province_ref_points"].keys()), key="future_ref_town")
-    ref_lat, ref_lon = region_cfg["province_ref_points"][town_choice]
-    render_nearest_shelters(shelters_all, ref_lat, ref_lon, town_choice)
+    with subtab2b:
+        town_choice = st.selectbox("Reference town", list(region_cfg["province_ref_points"].keys()), key="future_ref_town")
+        ref_lat, ref_lon = region_cfg["province_ref_points"][town_choice]
+        render_nearest_shelters(shelters_all, ref_lat, ref_lon, town_choice)
 
-    st.markdown("---")
+    with subtab2c:
+        # Charts
+        chart_col1, chart_col2 = st.columns(2)
 
-    # Charts
-    chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.subheader("📊 Risk Distribution")
+            risk_counts = df_future["risk_level"].value_counts().reset_index()
+            risk_counts.columns = ["Risk Level", "Count"]
+            fig_pie = px.pie(
+                risk_counts, values="Count", names="Risk Level",
+                color="Risk Level", color_discrete_map=FUTURE_COLOR_MAP,
+                hole=0.45,
+            )
+            fig_pie.update_traces(textinfo="percent+label", textfont_size=14)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-    with chart_col1:
-        st.subheader("📊 Risk Distribution")
-        risk_counts = df_future["risk_level"].value_counts().reset_index()
-        risk_counts.columns = ["Risk Level", "Count"]
-        fig_pie = px.pie(
-            risk_counts, values="Count", names="Risk Level",
-            color="Risk Level", color_discrete_map=FUTURE_COLOR_MAP,
-            hole=0.45,
+        with chart_col2:
+            st.subheader("🌡️ Temperature vs Fire Risk")
+            fig_scatter = px.scatter(
+                df_future, x="t2m_max", y="fire_probability",
+                color="risk_level", color_discrete_map=FUTURE_COLOR_MAP,
+                labels={"t2m_max": "Max Temperature (°C)", "fire_probability": "Fire Probability"},
+                hover_data={"lat": ":.3f", "lon": ":.3f", "rh2m": ":.1f"},
+                opacity=0.7,
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+        st.markdown("---")
+
+        # High Risk Table
+        st.subheader("🚨 High Risk Alert Zones")
+        if len(high_risk) > 0:
+            high_display = high_risk[["lat", "lon", "fire_probability", "t2m_max", "rh2m"]].copy()
+            high_display["fire_probability"] = high_display["fire_probability"].apply(lambda x: f"{x:.1%}")
+            high_display["t2m_max"] = high_display["t2m_max"].apply(lambda x: f"{x:.1f}°C")
+            high_display["rh2m"] = high_display["rh2m"].apply(lambda x: f"{x:.1f}%")
+            high_display.columns = ["Latitude", "Longitude", "Fire Probability", "Max Temp", "Humidity"]
+            st.dataframe(high_display.sort_values("Fire Probability", ascending=False), use_container_width=True, hide_index=True)
+
+            csv = high_risk.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download High Risk Zones (CSV)",
+                data=csv,
+                file_name=f"high_risk_zones_{date_str}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("✅ No high-risk zones predicted for this date!")
+
+    with subtab2d:
+        # ---------------------------------------------------------------
+        # Real alert dispatch: SMS + Voice + Demo Audio + USSD info
+        # (Africa's Talking)
+        # ---------------------------------------------------------------
+        render_alert_dispatch_section(len(high_risk), date_str, key_prefix="tab2")
+
+        st.markdown("---")
+        st.caption(
+            f"🔮 Predictions powered by PHOENIX Forecast API | "
+            f"Date: {date_str} | Method: Climatology | API: {API_BASE_URL}"
         )
-        fig_pie.update_traces(textinfo="percent+label", textfont_size=14)
-        st.plotly_chart(fig_pie, use_container_width=True)
 
-    with chart_col2:
-        st.subheader("🌡️ Temperature vs Fire Risk")
-        fig_scatter = px.scatter(
-            df_future, x="t2m_max", y="fire_probability",
-            color="risk_level", color_discrete_map=FUTURE_COLOR_MAP,
-            labels={"t2m_max": "Max Temperature (°C)", "fire_probability": "Fire Probability"},
-            hover_data={"lat": ":.3f", "lon": ":.3f", "rh2m": ":.1f"},
-            opacity=0.7,
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.markdown("---")
-
-    # High Risk Table
-    st.subheader("🚨 High Risk Alert Zones")
-    if len(high_risk) > 0:
-        high_display = high_risk[["lat", "lon", "fire_probability", "t2m_max", "rh2m"]].copy()
-        high_display["fire_probability"] = high_display["fire_probability"].apply(lambda x: f"{x:.1%}")
-        high_display["t2m_max"] = high_display["t2m_max"].apply(lambda x: f"{x:.1f}°C")
-        high_display["rh2m"] = high_display["rh2m"].apply(lambda x: f"{x:.1f}%")
-        high_display.columns = ["Latitude", "Longitude", "Fire Probability", "Max Temp", "Humidity"]
-        st.dataframe(high_display.sort_values("Fire Probability", ascending=False), use_container_width=True, hide_index=True)
-
-        csv = high_risk.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download High Risk Zones (CSV)",
-            data=csv,
-            file_name=f"high_risk_zones_{date_str}.csv",
-            mime="text/csv",
-        )
-    else:
-        st.success("✅ No high-risk zones predicted for this date!")
-
-    st.markdown("---")
-
-    # ---------------------------------------------------------------
-    # Real alert dispatch: SMS + Voice + Demo Audio + USSD info
-    # (Africa's Talking)
-    # ---------------------------------------------------------------
-    render_alert_dispatch_section(len(high_risk), date_str, key_prefix="tab2")
-
-    st.markdown("---")
-    st.caption(
-        f"🔮 Predictions powered by PHOENIX Forecast API | "
-        f"Date: {date_str} | Method: Climatology | API: {API_BASE_URL}"
-    )
 
 # =================================================================
 # TAB 3: Admin (password-protected)
