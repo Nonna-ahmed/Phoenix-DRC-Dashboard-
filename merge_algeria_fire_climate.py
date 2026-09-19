@@ -3,10 +3,12 @@ merge_algeria_fire_climate.py
 ================================
 Cleans north_algeria_climate_final.csv (removes NASA POWER's -999 fill
 values, fixes rows the auto-update job appended without the engineered
-features) and merges in fire_nrt_SV-C2_808728.csv (NASA FIRMS VIIRS
-active-fire detections) to produce a labeled training dataset — one row
-per (grid cell, date), with a binary FIRE column, matching the same
-label-building approach used for the original Congo model.
+features) and merges in NASA FIRMS VIIRS active-fire detections — from
+BOTH satellites (NOAA-20 and SNPP) and BOTH the historical archive and
+near-real-time feeds, so fire labels exist across the full 2020-2026
+span the climate data covers — to produce a labeled training dataset:
+one row per (grid cell, date), with a binary FIRE column, matching the
+same label-building approach used for the original Congo model.
 
 WHY THE CLEANING STEPS EXIST
 -----------------------------
@@ -27,6 +29,26 @@ WHY THE CLEANING STEPS EXIST
    (not just the gaps), so the rolling windows are correct at every
    boundary between the original bulk export and the auto-appended rows.
 
+3. FIRMS coverage gap (the reason for 4 fire files, not 1): a single
+   recent NRT export only covers the last few weeks — merging that alone
+   onto 6+ years of climate data would falsely label every earlier date
+   as "no fire" just because no detection data existed for it yet, not
+   because no fire happened. Using the ARCHIVE files (which go back to
+   2020-01-01) alongside the NRT files (which pick up where the archive
+   ends) gives real fire/no-fire ground truth across the same span the
+   weather data covers.
+
+4. FIRMS `type` filtering (archive files only): the standard/archive
+   FIRMS product tags each detection 0=presumed vegetation fire,
+   2=other static land source, 3=offshore. In this dataset roughly HALF
+   of all archive detections are type 2 — persistent industrial heat
+   sources (refineries, steel plants — Annaba and Skikda both have heavy
+   industry in this exact bounding box), not wildfires. Only type==0 is
+   kept. The NRT feed doesn't include the `type` field at all (a known
+   limitation of that near-real-time product), so NRT rows can't be
+   filtered the same way — flagged in the printed summary, not silently
+   ignored.
+
 FIRE LABEL — HOW IT'S BUILT
 -----------------------------
 Each FIRMS detection is a precise lat/lon point; the climate file is a
@@ -37,12 +59,11 @@ date). A grid-cell/date gets FIRE=1 if at least one detection matched
 it that day.
 
 `fire_detections` (count) and `frp_max` (max fire radiative power) are
-also kept, for reference and QA — but per this project's own documented
-finding for the Congo model, THESE TWO COLUMNS ARE LEAKAGE if used as
-model inputs: they are only known once a fire is already burning and
-detected, so they can't be used to predict risk *before* ignition.
-Drop them before training exactly as the Congo model did; they're
-included here only so you can sanity-check the label.
+computed for QA during the run (printed, not saved) — per this
+project's own documented finding for the Congo model, THESE ARE
+LEAKAGE if used as model inputs: they are only known once a fire is
+already burning and detected, so they can't be used to predict risk
+*before* ignition. They are dropped before the file is saved.
 
 Run:
     python3 merge_algeria_fire_climate.py
@@ -53,7 +74,12 @@ import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
 
 CLIMATE_CSV = "north_algeria_climate_final.csv"
-FIRE_CSV = "fire_nrt_SV-C2_808728.csv"
+FIRE_CSVS = [
+    "fire_archive_J1V-C2_808784.csv",  # NOAA-20, 2020-01-01 to 2026-06-30
+    "fire_nrt_J1V-C2_808784.csv",      # NOAA-20, 2026-07-01 to present
+    "fire_archive_SV-C2_808785.csv",   # SNPP, 2020-01-01 to 2026-06-30
+    "fire_nrt_SV-C2_808785.csv",       # SNPP, 2026-07-01 to present
+]
 OUTPUT_CSV = "north_algeria_climate_fire_labeled.csv"
 
 WEATHER_COLS = ["PRECTOTCORR", "RH2M", "T2M_MAX", "T2M_MIN", "WS2M", "WD2M"]
@@ -116,20 +142,60 @@ def clean_climate(path: str) -> pd.DataFrame:
     return df
 
 
-def load_fire_detections(path: str) -> pd.DataFrame:
+def _load_one_fire_file(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     n_total = len(df)
-    # Sanity check only — this file came back completely clean (no
-    # nulls, no -999-style fill values), but check anyway rather than
-    # assuming silently.
+
     numeric_cols = ["latitude", "longitude", "brightness", "scan", "track", "bright_t31", "frp"]
     bad = (df[numeric_cols] <= -900).any(axis=1) | df[numeric_cols].isna().any(axis=1)
     if bad.any():
-        print(f"[!] Dropping {int(bad.sum())} FIRMS row(s) with invalid/fill values.")
+        print(f"  [!] Dropping {int(bad.sum())} row(s) with invalid/fill values.")
         df = df[~bad].copy()
-    print(f"Loaded {len(df)}/{n_total} usable fire detections from {path} "
+
+    if "type" in df.columns:
+        # Archive product: keep only presumed vegetation fires (type 0).
+        # Type 2 ("other static land source" — industrial heat, not
+        # wildfire) and type 3 (offshore) are dropped.
+        n_before = len(df)
+        vegetation_fire = df["type"] == 0
+        n_industrial = int((df["type"] == 2).sum())
+        n_offshore = int((df["type"] == 3).sum())
+        df = df[vegetation_fire].copy()
+        print(f"  Archive file: kept {len(df)}/{n_before} type==0 (vegetation fire) rows "
+              f"— dropped {n_industrial} industrial/static-source + {n_offshore} offshore.")
+    else:
+        print(f"  NRT file: no `type` field available (known NRT-feed limitation) — "
+              f"all {len(df)} rows kept as-is, not filterable by fire type.")
+
+    print(f"  Loaded {len(df)}/{n_total} usable detections from {path} "
           f"({df['acq_date'].min()} to {df['acq_date'].max()}).")
     return df
+
+
+def load_fire_detections(paths: list) -> pd.DataFrame:
+    """Loads and combines every FIRMS export (both satellites, archive +
+    NRT), so fire labels exist across the full span the climate data
+    covers instead of just the most recent few weeks."""
+    frames = []
+    for path in paths:
+        print(f"Loading {path} ...")
+        frames.append(_load_one_fire_file(path))
+    combined = pd.concat(frames, ignore_index=True)
+    # Two different satellites can both detect the same real fire on the
+    # same day — that's not a duplicate to remove, it's two independent
+    # confirmations of the same event, and both feed the same daily
+    # grid-cell aggregation either way. Only drop EXACT duplicate rows
+    # (can happen if the same export was accidentally included twice).
+    before = len(combined)
+    combined = combined.drop_duplicates(
+        subset=["latitude", "longitude", "acq_date", "acq_time", "satellite"]
+    )
+    if len(combined) < before:
+        print(f"Dropped {before - len(combined)} exact-duplicate row(s) across files.")
+    print(f"\nCombined total: {len(combined)} fire detections, "
+          f"{combined['acq_date'].min()} to {combined['acq_date'].max()}, "
+          f"satellites={sorted(combined['satellite'].unique())}")
+    return combined
 
 
 def assign_nearest_grid_cell(fire_df: pd.DataFrame, grid_points: pd.DataFrame) -> pd.DataFrame:
@@ -156,7 +222,7 @@ def assign_nearest_grid_cell(fire_df: pd.DataFrame, grid_points: pd.DataFrame) -
 
 def main():
     climate = clean_climate(CLIMATE_CSV)
-    fire = load_fire_detections(FIRE_CSV)
+    fire = load_fire_detections(FIRE_CSVS)
 
     grid_points = climate[["LAT", "LON"]].drop_duplicates().reset_index(drop=True)
     fire_matched = assign_nearest_grid_cell(fire, grid_points)
