@@ -8,13 +8,25 @@ third region later means editing REGIONS here, not the app code.
 
 GENERIC PREDICTOR
 -----------------
-The Congo and Algeria fire-risk models were confirmed to share the exact
-same 8-feature schema (LAT, LON, DOY, T2M_MAX, T2M_MIN, RH2M, WS2M,
-PRECTOTCORR) and the same binary:logistic XGBoost objective. This module
-provides a region-agnostic predictor (predict_fire_risk_generic) that
-loads either model as a plain xgboost.Booster and applies ONE shared
-risk-level threshold — the same thresholds already shown to users in the
-dashboard sidebar (Low < 0.35, Medium 0.35-0.65, High >= 0.65).
+NOTE: Congo and Algeria do NOT share an identical feature schema. Congo's
+existing model expects 8 raw features (LAT, LON, DOY, T2M_MAX, T2M_MIN,
+RH2M, WS2M, PRECTOTCORR) and is served via congo_predict.py, unchanged.
+
+Algeria's model was trained on 9 features, with day-of-year encoded
+cyclically (doy_sin/doy_cos instead of raw DOY) to better capture
+seasonality — LAT, LON, PRECTOTCORR, RH2M, T2M_MAX, T2M_MIN, WS2M,
+doy_sin, doy_cos. Its model file is also saved as a bundle (metadata +
+model_comparison + the raw xgboost model nested under "xgboost_model"),
+not a bare XGBoost booster file.
+
+Because of this, predict_fire_risk_generic() does NOT assume a shared
+schema across regions. Each region's model bundle carries its own
+"feature_order" in its metadata; the predictor loads that, builds
+whichever engineered features the order calls for (currently just the
+cyclic DOY encoding), and orders the row accordingly. This keeps the
+function correctly "generic" as more regions with their own schemas get
+added, rather than silently mispredicting when a new region's model
+doesn't match Congo's original 8-feature layout.
 
 congo_api.py keeps using the existing congo_predict.py for the "congo"
 region specifically (unchanged behavior for the model that's already been
@@ -24,9 +36,11 @@ region. If congo_predict.py does anything beyond raw XGBoost inference
 this module only affects newly-added regions.
 """
 
-from typing import Dict, Tuple
-
-import pandas as pd
+import json
+import math
+import os
+import tempfile
+from typing import Dict, List, Tuple
 
 try:
     import xgboost as xgb
@@ -123,23 +137,81 @@ def region_choices() -> list:
 # -------------------------------------------------------------------
 # Generic XGBoost predictor — used for any region that isn't Congo
 # -------------------------------------------------------------------
-_MODEL_CACHE: Dict[str, "xgb.Booster"] = {}
+# Cache holds, per region: {"booster": xgb.Booster, "feature_order": [...]}
+_MODEL_CACHE: Dict[str, dict] = {}
 
-_FEATURE_ORDER = ["LAT", "LON", "DOY", "T2M_MAX", "T2M_MIN", "RH2M", "WS2M", "PRECTOTCORR"]
+
+def _load_bundle(model_json_path: str) -> dict:
+    with open(model_json_path) as f:
+        bundle = json.load(f)
+
+    # Support both a plain XGBoost booster file (old/Congo-style) and the
+    # newer bundle format {"metadata": {...}, "xgboost_model": {...}, ...}.
+    if "xgboost_model" in bundle:
+        raw_model = bundle["xgboost_model"]
+        feature_order = bundle["metadata"]["feature_order"]
+    else:
+        raise ValueError(
+            f"'{model_json_path}' doesn't look like a recognized model bundle "
+            "(missing 'xgboost_model' key). If this is a bare XGBoost booster "
+            "file, load it directly with load_model() from congo_predict.py "
+            "instead of the generic predictor."
+        )
+    return raw_model, feature_order
 
 
-def load_model(region_id: str):
-    """Loads (and caches) the XGBoost booster for a region. Cached so the
-    model file is only read from disk once per region per running process."""
+def load_model(region_id: str) -> dict:
+    """Loads (and caches) the XGBoost booster + its feature order for a
+    region. Cached so the model file is only read from disk once per
+    region per running process."""
     if not HAS_XGBOOST:
         raise RuntimeError("xgboost is not installed — required for any region other than "
                             "'congo' (which uses congo_predict.py instead).")
     if region_id not in _MODEL_CACHE:
         cfg = get_region(region_id)
+        raw_model, feature_order = _load_bundle(cfg["model_json"])
+
         booster = xgb.Booster()
-        booster.load_model(cfg["model_json"])
-        _MODEL_CACHE[region_id] = booster
+        # Booster.load_model wants a real file (or a buffer produced by
+        # save_raw); round-tripping through a temp file guarantees we hand
+        # it back exactly the bytes that were originally saved with
+        # xgb_model.save_model(...), regardless of xgboost version quirks
+        # around in-memory JSON buffers.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            json.dump(raw_model, tmp)
+            tmp_path = tmp.name
+        try:
+            booster.load_model(tmp_path)
+        finally:
+            os.remove(tmp_path)
+
+        _MODEL_CACHE[region_id] = {"booster": booster, "feature_order": feature_order}
     return _MODEL_CACHE[region_id]
+
+
+def _build_feature_row(feature_order: List[str], lat: float, lon: float, doy: int,
+                        t2m_max: float, t2m_min: float, rh2m: float,
+                        ws2m: float, prectotcorr: float) -> List[float]:
+    """Builds a feature row in whatever order this region's model expects,
+    deriving engineered features (currently: cyclic day-of-year) on demand
+    rather than assuming every region encodes DOY the same way."""
+    values = {
+        "LAT": lat, "LON": lon, "DOY": doy,
+        "T2M_MAX": t2m_max, "T2M_MIN": t2m_min,
+        "RH2M": rh2m, "WS2M": ws2m, "PRECTOTCORR": prectotcorr,
+    }
+    if "doy_sin" in feature_order:
+        values["doy_sin"] = math.sin(2 * math.pi * doy / 365.25)
+    if "doy_cos" in feature_order:
+        values["doy_cos"] = math.cos(2 * math.pi * doy / 365.25)
+
+    missing = [c for c in feature_order if c not in values]
+    if missing:
+        raise ValueError(
+            f"Model expects features {missing} that predict_fire_risk_generic() "
+            "doesn't know how to compute yet — add them to _build_feature_row()."
+        )
+    return [values[c] for c in feature_order]
 
 
 def predict_fire_risk_generic(region_id: str, lat: float, lon: float, doy: int,
@@ -147,13 +219,14 @@ def predict_fire_risk_generic(region_id: str, lat: float, lon: float, doy: int,
                                ws2m: float, prectotcorr: float) -> dict:
     """Region-agnostic prediction — same **kwargs-in, dict-out shape as
     congo_predict.predict_fire_risk(), so callers don't need to care which
-    path a given region takes."""
-    booster = load_model(region_id)
-    row = pd.DataFrame([{
-        "LAT": lat, "LON": lon, "DOY": doy,
-        "T2M_MAX": t2m_max, "T2M_MIN": t2m_min,
-        "RH2M": rh2m, "WS2M": ws2m, "PRECTOTCORR": prectotcorr,
-    }])
-    dmat = xgb.DMatrix(row, feature_names=_FEATURE_ORDER)
+    path a given region takes. Internally, each region's own feature_order
+    (stored in its model bundle) decides what gets fed to the model and in
+    what order."""
+    model = load_model(region_id)
+    booster, feature_order = model["booster"], model["feature_order"]
+
+    row = _build_feature_row(feature_order, lat, lon, doy, t2m_max, t2m_min,
+                              rh2m, ws2m, prectotcorr)
+    dmat = xgb.DMatrix([row], feature_names=feature_order)
     prob = float(booster.predict(dmat)[0])
     return {"fire_probability": round(prob, 4), "risk_level": classify_risk(prob)}
